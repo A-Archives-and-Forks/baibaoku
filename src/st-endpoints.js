@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import crypto from 'node:crypto';
 import bytes from 'bytes';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { parse } from '../../../src/character-card-parser.js';
@@ -322,6 +323,25 @@ async function waitForPendingSettingsSave(userHandle) {
 async function saveSettingsWithCache(req, userHandle) {
     const settingsPath = getSettingsPath(req);
     const text = JSON.stringify(req.body ?? {}, null, 4);
+    let currentStat = null;
+
+    try {
+        currentStat = await fs.promises.stat(settingsPath);
+    } catch (error) {
+        if (error?.code !== 'ENOENT') {
+            throw error;
+        }
+    }
+
+    if (currentStat) {
+        const currentText = hasFreshSettingsTextCache(userHandle, settingsPath, currentStat)
+            ? settingsFileCaches.get(userHandle).text
+            : await fs.promises.readFile(settingsPath, 'utf8');
+
+        if (currentText === text) {
+            return { result: 'ok', skipped: true };
+        }
+    }
 
     writeFileAtomicSync(settingsPath, text, 'utf8');
 
@@ -341,7 +361,6 @@ function getSettingsUserCache(userHandle) {
             payloadDirtyReason: 'initial',
             payloadDirtyAt: Date.now(),
             payloadBuiltAt: 0,
-            payloadRefreshPromise: null,
             payloadWatchers: new Map(),
             payloadWatchAttempted: false,
         });
@@ -352,25 +371,81 @@ function getSettingsUserCache(userHandle) {
 
 function getSettingsPayloadWatchTargets(directories) {
     return [
-        directories.koboldAI_Settings,
-        directories.novelAI_Settings,
-        directories.openAI_Settings,
-        directories.textGen_Settings,
-        directories.worlds,
-        directories.themes,
-        directories.movingUI,
-        directories.quickreplies,
-        directories.instruct,
-        directories.context,
-        directories.sysprompt,
-        directories.reasoning,
-    ].filter(Boolean);
+        { directoryPath: directories.koboldAI_Settings, sectionName: 'koboldai_settings' },
+        { directoryPath: directories.novelAI_Settings, sectionName: 'novelai_settings' },
+        { directoryPath: directories.openAI_Settings, sectionName: 'openai_settings' },
+        { directoryPath: directories.textGen_Settings, sectionName: 'textgenerationwebui_presets' },
+        { directoryPath: directories.worlds, sectionName: null },
+        { directoryPath: directories.themes, sectionName: 'themes' },
+        { directoryPath: directories.movingUI, sectionName: 'movingUIPresets' },
+        { directoryPath: directories.quickreplies, sectionName: 'quickReplyPresets' },
+        { directoryPath: directories.instruct, sectionName: 'instruct' },
+        { directoryPath: directories.context, sectionName: 'context' },
+        { directoryPath: directories.sysprompt, sectionName: 'sysprompt' },
+        { directoryPath: directories.reasoning, sectionName: 'reasoning' },
+    ].filter(target => target.directoryPath);
 }
 
 function markSettingsPayloadDirty(userCache, reason = 'unknown') {
     userCache.payloadDirty = true;
     userCache.payloadDirtyReason = reason;
     userCache.payloadDirtyAt = Date.now();
+    settingsResponseCaches.delete(userCache.userHandle);
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function formatSettingsWatchReason(target, eventType, filenameText) {
+    return `watch:${eventType}:${target.directoryPath}${filenameText ? `/${filenameText}` : ''}`;
+}
+
+async function handleSettingsPayloadWatchEvent(userCache, target, eventType, filename) {
+    const filenameText = filename ? String(filename) : '';
+    const reason = formatSettingsWatchReason(target, eventType, filenameText);
+
+    if (!filenameText) {
+        markSettingsPayloadDirty(userCache, `${reason}:unknown-file`);
+        return;
+    }
+
+    if (path.extname(filenameText).toLowerCase() !== '.json') {
+        return;
+    }
+
+    if (!target.sectionName) {
+        markSettingsPayloadDirty(userCache, reason);
+        return;
+    }
+
+    await delay(75);
+
+    const sectionCache = getSettingsSectionCache(userCache, target.sectionName);
+    const cached = sectionCache.get(filenameText);
+    const filePath = path.join(target.directoryPath, filenameText);
+    let stat;
+    let file;
+
+    try {
+        stat = await fs.promises.stat(filePath);
+        file = await fs.promises.readFile(filePath, 'utf8');
+    } catch {
+        if (cached) {
+            markSettingsPayloadDirty(userCache, `${reason}:missing`);
+        }
+        return;
+    }
+
+    const contentHash = hashSettingsFileContent(file);
+    if (cached?.contentHash === contentHash) {
+        cached.mtime = stat.mtimeMs;
+        cached.size = stat.size;
+        cached.contentHash = contentHash;
+        return;
+    }
+
+    markSettingsPayloadDirty(userCache, reason);
 }
 
 function ensureSettingsPayloadWatchers(userCache, directories) {
@@ -379,24 +454,29 @@ function ensureSettingsPayloadWatchers(userCache, directories) {
     }
 
     userCache.payloadWatchAttempted = true;
-    const targets = Array.from(new Set(getSettingsPayloadWatchTargets(directories)));
+    const targets = Array.from(new Map(
+        getSettingsPayloadWatchTargets(directories).map(target => [target.directoryPath, target]),
+    ).values());
 
-    for (const directoryPath of targets) {
+    for (const target of targets) {
         try {
-            const watcher = fs.watch(directoryPath, { persistent: false }, (eventType, filename) => {
-                const filenameText = filename ? String(filename) : '';
-                markSettingsPayloadDirty(userCache, `watch:${eventType}:${directoryPath}${filenameText ? `/${filenameText}` : ''}`);
+            const watcher = fs.watch(target.directoryPath, { persistent: false }, (eventType, filename) => {
+                void handleSettingsPayloadWatchEvent(userCache, target, eventType, filename)
+                    .catch((error) => {
+                        const filenameText = filename ? String(filename) : '';
+                        markSettingsPayloadDirty(userCache, `${formatSettingsWatchReason(target, eventType, filenameText)}:validate-error:${error.message}`);
+                    });
             });
 
             watcher.on('error', (error) => {
-                markSettingsPayloadDirty(userCache, `watch-error:${directoryPath}:${error.message}`);
-                console.warn(`[baibaoku] Settings payload watcher failed for ${directoryPath}:`, error.message);
+                markSettingsPayloadDirty(userCache, `watch-error:${target.directoryPath}:${error.message}`);
+                console.warn(`[baibaoku] Settings payload watcher failed for ${target.directoryPath}:`, error.message);
             });
 
-            userCache.payloadWatchers.set(directoryPath, watcher);
+            userCache.payloadWatchers.set(target.directoryPath, watcher);
         } catch (error) {
-            markSettingsPayloadDirty(userCache, `watch-unavailable:${directoryPath}:${error.message}`);
-            console.warn(`[baibaoku] Settings payload watcher unavailable for ${directoryPath}:`, error.message);
+            markSettingsPayloadDirty(userCache, `watch-unavailable:${target.directoryPath}:${error.message}`);
+            console.warn(`[baibaoku] Settings payload watcher unavailable for ${target.directoryPath}:`, error.message);
         }
     }
 }
@@ -443,6 +523,10 @@ async function readCachedParsedDirectory(userCache, sectionName, directoryPath) 
     return entries.map(entry => entry.value);
 }
 
+function hashSettingsFileContent(text) {
+    return crypto.createHash('sha1').update(text).digest('hex');
+}
+
 async function updateCachedJsonDirectory(sectionCache, directoryPath, options) {
     const {
         sortMode,
@@ -484,6 +568,7 @@ async function updateCachedJsonDirectory(sectionCache, directoryPath, options) {
             sectionCache.set(filename, {
                 mtime: stat.mtimeMs,
                 size: stat.size,
+                contentHash: hashSettingsFileContent(file),
                 name: removeFileExtension ? filename.replace(/\.[^/.]+$/, '') : filename,
                 value: valueMode === 'raw-json' ? file : parsed,
             });
@@ -522,12 +607,6 @@ async function getFastSettingsPayload(req, userHandle, metrics = {}) {
     metrics.payloadCache = userCache.payload ? 'stale' : 'miss';
     metrics.payloadDirtyReason = userCache.payloadDirtyReason || '';
     metrics.payloadDirtyAgeMs = userCache.payloadDirtyAt ? Date.now() - userCache.payloadDirtyAt : 0;
-
-    if (userCache.payload && settingsResponseCaches.has(userHandle)) {
-        metrics.payloadCache = 'stale-served';
-        scheduleSettingsPayloadRefresh(req, userHandle);
-        return userCache.payload;
-    }
 
     return buildFastSettingsPayload(req, userHandle);
 }
@@ -590,32 +669,6 @@ async function buildFastSettingsPayload(req, userHandle) {
     userCache.payloadBuiltAt = Date.now();
 
     return payload;
-}
-
-function scheduleSettingsPayloadRefresh(req, userHandle) {
-    const userCache = getSettingsUserCache(userHandle);
-
-    if (userCache.payloadRefreshPromise) {
-        return userCache.payloadRefreshPromise;
-    }
-
-    userCache.payloadRefreshPromise = (async () => {
-        const [settingsInfo, cachedPayload] = await Promise.all([
-            readSettingsTextWithCache(req, userHandle),
-            buildFastSettingsPayload(req, userHandle),
-        ]);
-        const staticPayload = await getStaticSettingsPayload();
-
-        getFastSettingsResponse(userHandle, settingsInfo, cachedPayload, staticPayload, true);
-    })()
-        .catch((error) => {
-            console.warn('[baibaoku] Failed to refresh settings payload cache in background:', error.message);
-        })
-        .finally(() => {
-            userCache.payloadRefreshPromise = null;
-        });
-
-    return userCache.payloadRefreshPromise;
 }
 
 async function getStaticSettingsPayload() {
@@ -971,6 +1024,9 @@ export function registerStEndpoints(router, manager) {
             const result = await queueSettingsSave(userHandle, () => saveSettingsWithCache(req, userHandle));
 
             res.set('X-Baibaoku-Elapsed-Ms', String(Date.now() - startedAt));
+            if (result.skipped) {
+                res.set('X-Baibaoku-Save-Skipped', 'true');
+            }
             res.json(result);
         } catch (error) {
             console.error('[baibaoku] Error in settings fast-save endpoint:', error);
