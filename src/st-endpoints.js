@@ -13,9 +13,10 @@ const FAST_CHARACTER_CACHE_STORE = 'character-fast-all';
 const FAST_CHARACTER_CACHE_VERSION = 1;
 const FAST_CHARACTER_CACHE_PAGE_SIZE = 1000;
 const SETTINGS_FAST_CONFIG_DATABASE = 'baibaoku.internal';
-const SETTINGS_FAST_CONFIG_STORE = 'settings-fast-config';
-const SETTINGS_FAST_CONFIG_KEY = 'settings';
+const SETTINGS_FAST_CONFIG_STORE = 'fast-config';
+const SETTINGS_FAST_CONFIG_KEY = 'global';
 const DEFAULT_SETTINGS_ACCELERATION_ENABLED = true;
+const DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED = true;
 const SETTINGS_TEXT_PERSIST_VERSION = 1;
 const SETTINGS_TEXT_PERSIST_FILE = 'settings-text-v1.json';
 const SETTINGS_PAYLOAD_PERSIST_VERSION = 1;
@@ -1310,12 +1311,25 @@ async function getSettingsFastConfig(req, manager) {
         SETTINGS_FAST_CONFIG_STORE,
         SETTINGS_FAST_CONFIG_KEY,
     );
-    const value = result.exists && result.value && typeof result.value === 'object'
+    let value = result.exists && result.value && typeof result.value === 'object'
         ? result.value
-        : {};
+        : null;
+
+    if (!value) {
+        const legacyResult = await manager.get(
+            req,
+            SETTINGS_FAST_CONFIG_DATABASE,
+            'settings-fast-config',
+            'settings',
+        );
+        value = legacyResult.exists && legacyResult.value && typeof legacyResult.value === 'object'
+            ? legacyResult.value
+            : {};
+    }
 
     return {
         settingsAccelerationEnabled: value.settingsAccelerationEnabled !== false,
+        characterListAccelerationEnabled: value.characterListAccelerationEnabled !== false,
     };
 }
 
@@ -1323,7 +1337,12 @@ async function setSettingsFastConfig(req, manager) {
     const current = await getSettingsFastConfig(req, manager);
     const next = {
         ...current,
-        settingsAccelerationEnabled: req.body?.settingsAccelerationEnabled !== false,
+        settingsAccelerationEnabled: req.body?.settingsAccelerationEnabled === undefined
+            ? current.settingsAccelerationEnabled !== false
+            : req.body.settingsAccelerationEnabled !== false,
+        characterListAccelerationEnabled: req.body?.characterListAccelerationEnabled === undefined
+            ? current.characterListAccelerationEnabled !== false
+            : req.body.characterListAccelerationEnabled !== false,
     };
 
     await manager.set(
@@ -1343,7 +1362,10 @@ async function getSettingsFastConfigSafe(req, manager) {
         return await getSettingsFastConfig(req, manager);
     } catch (error) {
         console.warn('[baibaoku] Failed to read settings fast config; using defaults:', error.message);
-        return { settingsAccelerationEnabled: DEFAULT_SETTINGS_ACCELERATION_ENABLED };
+        return {
+            settingsAccelerationEnabled: DEFAULT_SETTINGS_ACCELERATION_ENABLED,
+            characterListAccelerationEnabled: DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED,
+        };
     }
 }
 
@@ -1351,7 +1373,9 @@ function makeEarlyBridgeScript(options = {}) {
     const apiPrefix = `/api/plugins/${PLUGIN_ID}`;
     const fastSettingsGetPath = `${apiPrefix}/v1/settings/fast-get`;
     const fastSettingsSavePath = `${apiPrefix}/v1/settings/fast-save`;
+    const fastCharacterListPath = `${apiPrefix}/v1/characters/fast-all`;
     const settingsAccelerationEnabled = options.settingsAccelerationEnabled !== false;
+    const characterListAccelerationEnabled = options.characterListAccelerationEnabled !== false;
 
     return `/* baibaoku early bridge v${EARLY_BRIDGE_VERSION} */
 (function () {
@@ -1361,7 +1385,9 @@ function makeEarlyBridgeScript(options = {}) {
   var VERSION = ${JSON.stringify(String(EARLY_BRIDGE_VERSION))};
   var FAST_SETTINGS_GET = ${JSON.stringify(fastSettingsGetPath)};
   var FAST_SETTINGS_SAVE = ${JSON.stringify(fastSettingsSavePath)};
+  var FAST_CHARACTER_LIST = ${JSON.stringify(fastCharacterListPath)};
   var SETTINGS_ACCELERATION_ENABLED = ${JSON.stringify(settingsAccelerationEnabled)};
+  var CHARACTER_LIST_ACCELERATION_ENABLED = ${JSON.stringify(characterListAccelerationEnabled)};
 
   if (window[FLAG] && window[FLAG].installed) {
     return;
@@ -1381,7 +1407,8 @@ function makeEarlyBridgeScript(options = {}) {
   state.installedAt = Date.now();
   state.fastGetPath = FAST_SETTINGS_GET;
   state.fastSavePath = FAST_SETTINGS_SAVE;
-  state.requests = state.requests || { get: 0, save: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0 };
+  state.fastCharacterListPath = FAST_CHARACTER_LIST;
+  state.requests = state.requests || { get: 0, save: 0, characters: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0 };
   state.rawFetch = rawFetch;
   state.settingsGetCache = state.settingsGetCache || null;
   state.settingsGetPending = null;
@@ -1401,6 +1428,17 @@ function makeEarlyBridgeScript(options = {}) {
   state.setSettingsAccelerationEnabled = writeSettingsAccelerationEnabled;
   state.settingsAccelerationEnabled = SETTINGS_ACCELERATION_ENABLED;
 
+  function writeCharacterListAccelerationEnabled(enabled) {
+    state.characterListAccelerationEnabled = Boolean(enabled);
+    return state.characterListAccelerationEnabled;
+  }
+
+  state.isCharacterListAccelerationEnabled = function () {
+    return state.characterListAccelerationEnabled !== false;
+  };
+  state.setCharacterListAccelerationEnabled = writeCharacterListAccelerationEnabled;
+  state.characterListAccelerationEnabled = CHARACTER_LIST_ACCELERATION_ENABLED;
+
   function toUrl(input) {
     try {
       if (typeof input === 'string') return new URL(input, location.href);
@@ -1418,6 +1456,7 @@ function makeEarlyBridgeScript(options = {}) {
     if (!url || url.origin !== location.origin || method !== 'POST') return null;
     if (url.pathname === '/api/settings/get') return { kind: 'get', fastPath: FAST_SETTINGS_GET };
     if (url.pathname === '/api/settings/save') return { kind: 'save', fastPath: FAST_SETTINGS_SAVE };
+    if (url.pathname === '/api/characters/all') return { kind: 'characters', fastPath: FAST_CHARACTER_LIST };
     return null;
   }
 
@@ -1484,6 +1523,43 @@ function makeEarlyBridgeScript(options = {}) {
     return undefined;
   }
 
+  function parseJsonOrNull(text) {
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function isPlainEmptyObject(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0;
+  }
+
+  async function readJsonBody(input, init) {
+    if (init && Object.prototype.hasOwnProperty.call(init, 'body')) {
+      var body = init.body;
+      if (typeof body === 'string') return parseJsonOrNull(body);
+      if (body && typeof body.text === 'function') return parseJsonOrNull(await body.text());
+      return null;
+    }
+
+    try {
+      if (input instanceof Request && !input.bodyUsed && input.body) {
+        return await input.clone().json().catch(function () { return null; });
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  async function shouldUseFastRoute(route, input, init) {
+    if (!route) return false;
+    if (route.kind === 'characters') {
+      if (state.characterListAccelerationEnabled === false) return false;
+      return isPlainEmptyObject(await readJsonBody(input, init));
+    }
+    return state.settingsAccelerationEnabled !== false;
+  }
+
   async function makeFastInit(input, init, method) {
     var next = {};
     if (input instanceof Request) {
@@ -1520,9 +1596,9 @@ function makeEarlyBridgeScript(options = {}) {
   window.fetch = async function baibaokuEarlyFetch(input, init) {
     var url = toUrl(input);
     var method = getMethod(input, init);
-    var route = state.settingsAccelerationEnabled !== false ? shouldIntercept(url, method) : null;
+    var route = shouldIntercept(url, method);
 
-    if (!route) {
+    if (!await shouldUseFastRoute(route, input, init)) {
       var originalResponse = await rawFetch(input, init);
       if (originalResponse && originalResponse.ok && shouldInvalidateSettingsGetCache(url, method)) {
         clearSettingsGetCache('mutation:' + url.pathname);
@@ -1561,6 +1637,11 @@ function makeEarlyBridgeScript(options = {}) {
             });
         } else if (route.kind === 'save') {
           clearSettingsGetCache('save');
+        } else if (route.kind === 'characters') {
+          var characterData = await response.clone().json().catch(function () { return null; });
+          if (!Array.isArray(characterData)) {
+            throw new Error('Fast character list returned a non-array payload');
+          }
         }
         return response;
       }
@@ -1628,6 +1709,40 @@ export function registerStEndpoints(router, manager) {
         } catch (error) {
             console.error('[baibaoku] Error in fast-all endpoint:', error);
             res.status(500).json({ error: true, message: error.message });
+        }
+    });
+
+    router.get('/v1/fast-config', async (req, res) => {
+        try {
+            const userHandle = req.user?.profile?.handle;
+            if (!userHandle) {
+                return res.status(401).json({ error: true, message: 'Unauthorized' });
+            }
+
+            res.json({
+                ok: true,
+                data: await getSettingsFastConfig(req, manager),
+            });
+        } catch (error) {
+            console.error('[baibaoku] Error in fast-config endpoint:', error);
+            res.status(500).json({ ok: false, error: true, message: error.message });
+        }
+    });
+
+    router.post('/v1/fast-config', async (req, res) => {
+        try {
+            const userHandle = req.user?.profile?.handle;
+            if (!userHandle) {
+                return res.status(401).json({ error: true, message: 'Unauthorized' });
+            }
+
+            res.json({
+                ok: true,
+                data: await setSettingsFastConfig(req, manager),
+            });
+        } catch (error) {
+            console.error('[baibaoku] Error in fast-config endpoint:', error);
+            res.status(500).json({ ok: false, error: true, message: error.message });
         }
     });
 
