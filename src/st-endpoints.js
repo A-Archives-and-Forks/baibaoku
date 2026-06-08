@@ -12,6 +12,10 @@ const FAST_CHARACTER_CACHE_DATABASE = 'baibaoku.internal';
 const FAST_CHARACTER_CACHE_STORE = 'character-fast-all';
 const FAST_CHARACTER_CACHE_VERSION = 1;
 const FAST_CHARACTER_CACHE_PAGE_SIZE = 1000;
+const SETTINGS_FAST_CONFIG_DATABASE = 'baibaoku.internal';
+const SETTINGS_FAST_CONFIG_STORE = 'settings-fast-config';
+const SETTINGS_FAST_CONFIG_KEY = 'settings';
+const DEFAULT_SETTINGS_ACCELERATION_ENABLED = true;
 
 // Cache structure: Map<userHandle, Map<filename, { mtime: number, size: number, data: Object }>>
 const userCaches = new Map();
@@ -28,7 +32,7 @@ const settingsSaveLocks = new Map();
 // Cache structure: Map<userHandle, { key: string, text: string, gzipBuffer?: Buffer }>
 const settingsResponseCaches = new Map();
 let staticSettingsPayload = null;
-const EARLY_BRIDGE_VERSION = 2;
+const EARLY_BRIDGE_VERSION = 3;
 
 /**
  * Normalizes tags from V1/V2 char data structure.
@@ -751,10 +755,55 @@ function requestAcceptsGzip(req) {
     return /\bgzip\b/i.test(String(req.headers?.['accept-encoding'] || ''));
 }
 
-function makeEarlyBridgeScript() {
+async function getSettingsFastConfig(req, manager) {
+    const result = await manager.get(
+        req,
+        SETTINGS_FAST_CONFIG_DATABASE,
+        SETTINGS_FAST_CONFIG_STORE,
+        SETTINGS_FAST_CONFIG_KEY,
+    );
+    const value = result.exists && result.value && typeof result.value === 'object'
+        ? result.value
+        : {};
+
+    return {
+        settingsAccelerationEnabled: value.settingsAccelerationEnabled !== false,
+    };
+}
+
+async function setSettingsFastConfig(req, manager) {
+    const current = await getSettingsFastConfig(req, manager);
+    const next = {
+        ...current,
+        settingsAccelerationEnabled: req.body?.settingsAccelerationEnabled !== false,
+    };
+
+    await manager.set(
+        req,
+        SETTINGS_FAST_CONFIG_DATABASE,
+        SETTINGS_FAST_CONFIG_STORE,
+        SETTINGS_FAST_CONFIG_KEY,
+        next,
+        { type: 'json' },
+    );
+
+    return next;
+}
+
+async function getSettingsFastConfigSafe(req, manager) {
+    try {
+        return await getSettingsFastConfig(req, manager);
+    } catch (error) {
+        console.warn('[baibaoku] Failed to read settings fast config; using defaults:', error.message);
+        return { settingsAccelerationEnabled: DEFAULT_SETTINGS_ACCELERATION_ENABLED };
+    }
+}
+
+function makeEarlyBridgeScript(options = {}) {
     const apiPrefix = `/api/plugins/${PLUGIN_ID}`;
     const fastSettingsGetPath = `${apiPrefix}/v1/settings/fast-get`;
     const fastSettingsSavePath = `${apiPrefix}/v1/settings/fast-save`;
+    const settingsAccelerationEnabled = options.settingsAccelerationEnabled !== false;
 
     return `/* baibaoku early bridge v${EARLY_BRIDGE_VERSION} */
 (function () {
@@ -764,6 +813,7 @@ function makeEarlyBridgeScript() {
   var VERSION = ${JSON.stringify(String(EARLY_BRIDGE_VERSION))};
   var FAST_SETTINGS_GET = ${JSON.stringify(fastSettingsGetPath)};
   var FAST_SETTINGS_SAVE = ${JSON.stringify(fastSettingsSavePath)};
+  var SETTINGS_ACCELERATION_ENABLED = ${JSON.stringify(settingsAccelerationEnabled)};
 
   if (window[FLAG] && window[FLAG].installed) {
     return;
@@ -787,6 +837,21 @@ function makeEarlyBridgeScript() {
   state.rawFetch = rawFetch;
   state.settingsGetCache = state.settingsGetCache || null;
   state.settingsGetPending = null;
+
+  function writeSettingsAccelerationEnabled(enabled) {
+    var next = Boolean(enabled);
+    state.settingsAccelerationEnabled = next;
+    if (!next) {
+      clearSettingsGetCache('settings-acceleration-disabled');
+    }
+    return next;
+  }
+
+  state.isSettingsAccelerationEnabled = function () {
+    return state.settingsAccelerationEnabled !== false;
+  };
+  state.setSettingsAccelerationEnabled = writeSettingsAccelerationEnabled;
+  state.settingsAccelerationEnabled = SETTINGS_ACCELERATION_ENABLED;
 
   function toUrl(input) {
     try {
@@ -907,7 +972,7 @@ function makeEarlyBridgeScript() {
   window.fetch = async function baibaokuEarlyFetch(input, init) {
     var url = toUrl(input);
     var method = getMethod(input, init);
-    var route = shouldIntercept(url, method);
+    var route = state.settingsAccelerationEnabled !== false ? shouldIntercept(url, method) : null;
 
     if (!route) {
       var originalResponse = await rawFetch(input, init);
@@ -977,10 +1042,16 @@ export function closeStEndpointCaches() {
 }
 
 export function registerStEndpoints(router, manager) {
-    router.get('/v1/early/bridge.js', (_req, res) => {
-        res.type('application/javascript; charset=utf-8');
-        res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-        res.send(makeEarlyBridgeScript());
+    router.get('/v1/early/bridge.js', async (req, res) => {
+        try {
+            const config = await getSettingsFastConfigSafe(req, manager);
+            res.type('application/javascript; charset=utf-8');
+            res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+            res.send(makeEarlyBridgeScript(config));
+        } catch (error) {
+            console.error('[baibaoku] Error in early bridge endpoint:', error);
+            res.status(500).type('application/javascript; charset=utf-8').send(`console.error(${JSON.stringify(error.message)});`);
+        }
     });
 
     router.post('/v1/characters/fast-all', async (req, res) => {
@@ -1009,6 +1080,40 @@ export function registerStEndpoints(router, manager) {
         } catch (error) {
             console.error('[baibaoku] Error in fast-all endpoint:', error);
             res.status(500).json({ error: true, message: error.message });
+        }
+    });
+
+    router.get('/v1/settings/fast-config', async (req, res) => {
+        try {
+            const userHandle = req.user?.profile?.handle;
+            if (!userHandle) {
+                return res.status(401).json({ error: true, message: 'Unauthorized' });
+            }
+
+            res.json({
+                ok: true,
+                data: await getSettingsFastConfig(req, manager),
+            });
+        } catch (error) {
+            console.error('[baibaoku] Error in settings fast-config endpoint:', error);
+            res.status(500).json({ ok: false, error: true, message: error.message });
+        }
+    });
+
+    router.post('/v1/settings/fast-config', async (req, res) => {
+        try {
+            const userHandle = req.user?.profile?.handle;
+            if (!userHandle) {
+                return res.status(401).json({ error: true, message: 'Unauthorized' });
+            }
+
+            res.json({
+                ok: true,
+                data: await setSettingsFastConfig(req, manager),
+            });
+        } catch (error) {
+            console.error('[baibaoku] Error in settings fast-config endpoint:', error);
+            res.status(500).json({ ok: false, error: true, message: error.message });
         }
     });
 
