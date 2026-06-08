@@ -16,6 +16,14 @@ const SETTINGS_FAST_CONFIG_DATABASE = 'baibaoku.internal';
 const SETTINGS_FAST_CONFIG_STORE = 'settings-fast-config';
 const SETTINGS_FAST_CONFIG_KEY = 'settings';
 const DEFAULT_SETTINGS_ACCELERATION_ENABLED = true;
+const SETTINGS_TEXT_PERSIST_VERSION = 1;
+const SETTINGS_TEXT_PERSIST_FILE = 'settings-text-v1.json';
+const SETTINGS_PAYLOAD_PERSIST_VERSION = 1;
+const SETTINGS_PAYLOAD_PERSIST_FILE = 'settings-payload-v1.json';
+const SETTINGS_RESPONSE_PERSIST_VERSION = 1;
+const SETTINGS_RESPONSE_META_FILE = 'settings-response-v1.json';
+const SETTINGS_RESPONSE_BODY_FILE = 'settings-response-v1.body';
+const SETTINGS_RESPONSE_GZIP_FILE = 'settings-response-v1.gzip';
 
 // Cache structure: Map<userHandle, Map<filename, { mtime: number, size: number, data: Object }>>
 const userCaches = new Map();
@@ -261,6 +269,30 @@ function getSettingsPath(req) {
     return path.join(req.user.directories.root, SETTINGS_FILE);
 }
 
+function getBaibaokuCacheDirectory(req) {
+    return path.join(req.user.directories.root, 'baibaoku', 'cache');
+}
+
+function getSettingsTextPersistPath(req) {
+    return path.join(getBaibaokuCacheDirectory(req), SETTINGS_TEXT_PERSIST_FILE);
+}
+
+function getSettingsPayloadPersistPath(req) {
+    return path.join(getBaibaokuCacheDirectory(req), SETTINGS_PAYLOAD_PERSIST_FILE);
+}
+
+function getSettingsResponseMetaPath(req) {
+    return path.join(getBaibaokuCacheDirectory(req), SETTINGS_RESPONSE_META_FILE);
+}
+
+function getSettingsResponseBodyPath(req) {
+    return path.join(getBaibaokuCacheDirectory(req), SETTINGS_RESPONSE_BODY_FILE);
+}
+
+function getSettingsResponseGzipPath(req) {
+    return path.join(getBaibaokuCacheDirectory(req), SETTINGS_RESPONSE_GZIP_FILE);
+}
+
 function cacheSettingsText(userHandle, settingsPath, text, stat) {
     settingsFileCaches.set(userHandle, {
         path: settingsPath,
@@ -270,6 +302,69 @@ function cacheSettingsText(userHandle, settingsPath, text, stat) {
         updatedAt: Date.now(),
     });
     settingsResponseCaches.delete(userHandle);
+}
+
+function schedulePersistSettingsText(req, userHandle) {
+    setTimeout(() => {
+        void persistSettingsTextToDisk(req, userHandle)
+            .catch((error) => {
+                console.warn('[baibaoku] Failed to persist settings text cache:', error.message);
+            });
+    }, 0);
+}
+
+async function persistSettingsTextToDisk(req, userHandle) {
+    const cached = settingsFileCaches.get(userHandle);
+    if (!cached) {
+        return false;
+    }
+
+    const payload = {
+        version: SETTINGS_TEXT_PERSIST_VERSION,
+        savedAt: Date.now(),
+        path: cached.path,
+        mtime: cached.mtime,
+        size: cached.size,
+        updatedAt: cached.updatedAt,
+        text: cached.text,
+    };
+
+    await writeFileAtomicAsync(getSettingsTextPersistPath(req), JSON.stringify(payload));
+    return true;
+}
+
+async function restoreSettingsTextFromDisk(req, userHandle, settingsPath, stat) {
+    let persisted;
+
+    try {
+        persisted = JSON.parse(await fs.promises.readFile(getSettingsTextPersistPath(req), 'utf8'));
+    } catch {
+        return null;
+    }
+
+    if (
+        persisted?.version !== SETTINGS_TEXT_PERSIST_VERSION
+        || persisted.path !== settingsPath
+        || persisted.mtime !== stat.mtimeMs
+        || persisted.size !== stat.size
+        || typeof persisted.text !== 'string'
+    ) {
+        return null;
+    }
+
+    settingsFileCaches.set(userHandle, {
+        path: settingsPath,
+        text: persisted.text,
+        mtime: stat.mtimeMs,
+        size: stat.size,
+        updatedAt: Number(persisted.updatedAt) || Date.now(),
+    });
+
+    return {
+        ...settingsFileCaches.get(userHandle),
+        cacheHit: true,
+        cacheStatus: 'persistent-hit',
+    };
 }
 
 function hasFreshSettingsTextCache(userHandle, settingsPath, stat) {
@@ -291,15 +386,23 @@ async function readSettingsTextWithCache(req, userHandle) {
         return {
             ...settingsFileCaches.get(userHandle),
             cacheHit: true,
+            cacheStatus: 'hit',
         };
+    }
+
+    const persisted = await restoreSettingsTextFromDisk(req, userHandle, settingsPath, stat);
+    if (persisted) {
+        return persisted;
     }
 
     const text = await fs.promises.readFile(settingsPath, 'utf8');
     cacheSettingsText(userHandle, settingsPath, text, stat);
+    schedulePersistSettingsText(req, userHandle);
 
     return {
         ...settingsFileCaches.get(userHandle),
         cacheHit: false,
+        cacheStatus: 'miss',
     };
 }
 
@@ -351,6 +454,7 @@ async function saveSettingsWithCache(req, userHandle) {
 
     const stat = await fs.promises.stat(settingsPath);
     cacheSettingsText(userHandle, settingsPath, text, stat);
+    schedulePersistSettingsText(req, userHandle);
 
     return { result: 'ok' };
 }
@@ -365,6 +469,9 @@ function getSettingsUserCache(userHandle) {
             payloadDirtyReason: 'initial',
             payloadDirtyAt: Date.now(),
             payloadBuiltAt: 0,
+            payloadCacheKey: '',
+            payloadPersistedBuiltAt: 0,
+            payloadPersistPromise: null,
             payloadWatchers: new Map(),
             payloadWatchAttempted: false,
         });
@@ -531,6 +638,31 @@ function hashSettingsFileContent(text) {
     return crypto.createHash('sha1').update(text).digest('hex');
 }
 
+function hashSettingsJson(value) {
+    return crypto.createHash('sha1').update(JSON.stringify(value)).digest('hex');
+}
+
+function computeSettingsPayloadCacheKey(userCache, payload) {
+    const sections = {};
+
+    for (const [sectionName, sectionCache] of Array.from(userCache.sections.entries()).sort(([a], [b]) => a.localeCompare(b))) {
+        sections[sectionName] = Array.from(sectionCache.entries())
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([filename, entry]) => ({
+                filename,
+                name: entry.name,
+                contentHash: entry.contentHash || null,
+                size: entry.size,
+            }));
+    }
+
+    return hashSettingsJson({
+        version: SETTINGS_PAYLOAD_PERSIST_VERSION,
+        sections,
+        world_names: Array.isArray(payload?.world_names) ? payload.world_names : [],
+    });
+}
+
 async function updateCachedJsonDirectory(sectionCache, directoryPath, options) {
     const {
         sortMode,
@@ -597,6 +729,238 @@ async function readWorldNames(directoryPath) {
     return worldFiles.map(item => path.parse(item).name);
 }
 
+async function getJsonDirectorySignature(directoryPath, options = {}) {
+    const caseInsensitiveExtension = options.caseInsensitiveExtension === true;
+    const files = (await fs.promises.readdir(directoryPath))
+        .filter((file) => {
+            const extension = path.extname(file);
+            return caseInsensitiveExtension ? extension.toLowerCase() === '.json' : extension === '.json';
+        })
+        .sort((a, b) => a.localeCompare(b));
+    const signature = {};
+
+    await Promise.all(files.map(async (filename) => {
+        const stat = await fs.promises.stat(path.join(directoryPath, filename));
+        signature[filename] = {
+            mtime: stat.mtimeMs,
+            size: stat.size,
+        };
+    }));
+
+    return signature;
+}
+
+function sameDirectorySignature(left = {}, right = {}) {
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+
+    if (leftKeys.length !== rightKeys.length) {
+        return false;
+    }
+
+    return leftKeys.every((filename, index) => {
+        const otherFilename = rightKeys[index];
+        const leftFile = left[filename];
+        const rightFile = right[otherFilename];
+
+        return filename === otherFilename
+            && leftFile?.mtime === rightFile?.mtime
+            && leftFile?.size === rightFile?.size;
+    });
+}
+
+function sameDirectoryFileNames(left = {}, right = {}) {
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+
+    return leftKeys.length === rightKeys.length
+        && leftKeys.every((filename, index) => filename === rightKeys[index]);
+}
+
+async function reconcilePersistedSectionSignature(directoryPath, persistedSection, state = {}) {
+    const currentSignature = await getJsonDirectorySignature(directoryPath);
+    const persistedSignature = persistedSection?.signature || {};
+    const persistedFiles = persistedSection?.files || {};
+
+    if (sameDirectorySignature(currentSignature, persistedSignature)) {
+        return true;
+    }
+
+    if (!sameDirectoryFileNames(currentSignature, persistedSignature)) {
+        return false;
+    }
+
+    for (const [filename, currentFile] of Object.entries(currentSignature)) {
+        const persistedFile = persistedSignature[filename];
+        if (persistedFile?.mtime === currentFile.mtime && persistedFile?.size === currentFile.size) {
+            continue;
+        }
+
+        const persistedCacheEntry = persistedFiles[filename];
+        if (!persistedCacheEntry?.contentHash) {
+            return false;
+        }
+
+        const file = await fs.promises.readFile(path.join(directoryPath, filename), 'utf8');
+        const contentHash = hashSettingsFileContent(file);
+        if (contentHash !== persistedCacheEntry.contentHash) {
+            return false;
+        }
+
+        state.reconciled = true;
+        persistedSignature[filename] = currentFile;
+        persistedCacheEntry.mtime = currentFile.mtime;
+        persistedCacheEntry.size = currentFile.size;
+        persistedCacheEntry.contentHash = contentHash;
+    }
+
+    return true;
+}
+
+async function writeFileAtomicAsync(filePath, data, options = 'utf8') {
+    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+    const tempPath = `${filePath}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+
+    try {
+        await fs.promises.writeFile(tempPath, data, options);
+        await fs.promises.rename(tempPath, filePath);
+    } catch (error) {
+        await fs.promises.unlink(tempPath).catch(() => {});
+        throw error;
+    }
+}
+
+async function restoreSettingsPayloadFromDisk(req, userHandle, directories) {
+    const persistPath = getSettingsPayloadPersistPath(req);
+    let persisted;
+
+    try {
+        persisted = JSON.parse(await fs.promises.readFile(persistPath, 'utf8'));
+    } catch {
+        return false;
+    }
+
+    if (persisted?.version !== SETTINGS_PAYLOAD_PERSIST_VERSION || !persisted.payload || !persisted.sections) {
+        return false;
+    }
+
+    const targets = getSettingsPayloadWatchTargets(directories);
+    const restoreState = { reconciled: false };
+
+    for (const target of targets) {
+        if (target.sectionName) {
+            const persistedSection = persisted.sections[target.sectionName];
+            if (!persistedSection || !await reconcilePersistedSectionSignature(target.directoryPath, persistedSection, restoreState)) {
+                return false;
+            }
+            continue;
+        }
+
+        const currentSignature = await getJsonDirectorySignature(target.directoryPath, {
+            caseInsensitiveExtension: true,
+        });
+        if (!sameDirectorySignature(currentSignature, persisted.worlds?.signature)) {
+            return false;
+        }
+    }
+
+    const userCache = getSettingsUserCache(userHandle);
+    userCache.sections.clear();
+
+    for (const [sectionName, persistedSection] of Object.entries(persisted.sections)) {
+        const sectionCache = new Map();
+        for (const [filename, entry] of Object.entries(persistedSection.files || {})) {
+            sectionCache.set(filename, entry);
+        }
+        userCache.sections.set(sectionName, sectionCache);
+    }
+
+    userCache.payload = persisted.payload;
+    userCache.payloadDirty = false;
+    userCache.payloadDirtyReason = '';
+    userCache.payloadDirtyAt = 0;
+    userCache.payloadBuiltAt = Number(persisted.payloadBuiltAt) || Date.now();
+    userCache.payloadCacheKey = persisted.payloadCacheKey || computeSettingsPayloadCacheKey(userCache, persisted.payload);
+    userCache.payloadPersistedBuiltAt = restoreState.reconciled ? 0 : userCache.payloadBuiltAt;
+    return true;
+}
+
+function ensureSettingsPayloadPersisted(req, userHandle) {
+    const userCache = getSettingsUserCache(userHandle);
+
+    if (!canUseCachedSettingsPayload(userCache)) {
+        return null;
+    }
+
+    if (userCache.payloadPersistedBuiltAt === userCache.payloadBuiltAt) {
+        return userCache.payloadPersistPromise;
+    }
+
+    if (userCache.payloadPersistPromise) {
+        return userCache.payloadPersistPromise;
+    }
+
+    userCache.payloadPersistPromise = new Promise(resolve => setTimeout(resolve, 0))
+        .then(() => persistSettingsPayloadToDisk(req, userHandle))
+        .catch((error) => {
+            console.warn('[baibaoku] Failed to persist settings payload cache:', error.message);
+            return false;
+        })
+        .finally(() => {
+            userCache.payloadPersistPromise = null;
+        });
+
+    return userCache.payloadPersistPromise;
+}
+
+async function persistSettingsPayloadToDisk(req, userHandle) {
+    const userCache = getSettingsUserCache(userHandle);
+
+    if (!canUseCachedSettingsPayload(userCache)) {
+        return false;
+    }
+
+    const cachedPayload = userCache.payload;
+    const payloadBuiltAt = userCache.payloadBuiltAt;
+    const directories = req.user.directories;
+    const sections = {};
+
+    for (const target of getSettingsPayloadWatchTargets(directories)) {
+        const signature = await getJsonDirectorySignature(target.directoryPath, {
+            caseInsensitiveExtension: !target.sectionName,
+        });
+
+        if (!target.sectionName) {
+            sections.__worlds__ = { signature };
+            continue;
+        }
+
+        const sectionCache = getSettingsSectionCache(userCache, target.sectionName);
+        sections[target.sectionName] = {
+            signature,
+            files: Object.fromEntries(sectionCache.entries()),
+        };
+    }
+
+    const persistPayload = {
+        version: SETTINGS_PAYLOAD_PERSIST_VERSION,
+        savedAt: Date.now(),
+        payloadBuiltAt,
+        payloadCacheKey: userCache.payloadCacheKey || computeSettingsPayloadCacheKey(userCache, cachedPayload),
+        sections: Object.fromEntries(Object.entries(sections).filter(([sectionName]) => sectionName !== '__worlds__')),
+        worlds: sections.__worlds__ || { signature: {} },
+        payload: cachedPayload,
+    };
+
+    if (!canUseCachedSettingsPayload(userCache) || userCache.payload !== cachedPayload || userCache.payloadBuiltAt !== payloadBuiltAt) {
+        return false;
+    }
+
+    await writeFileAtomicAsync(getSettingsPayloadPersistPath(req), JSON.stringify(persistPayload));
+    userCache.payloadPersistedBuiltAt = payloadBuiltAt;
+    return true;
+}
+
 async function getFastSettingsPayload(req, userHandle, metrics = {}) {
     const userCache = getSettingsUserCache(userHandle);
     const directories = req.user.directories;
@@ -606,6 +970,17 @@ async function getFastSettingsPayload(req, userHandle, metrics = {}) {
     if (canUseCachedSettingsPayload(userCache)) {
         metrics.payloadCache = 'hit';
         return userCache.payload;
+    }
+
+    if (!userCache.payload) {
+        try {
+            if (await restoreSettingsPayloadFromDisk(req, userHandle, directories)) {
+                metrics.payloadCache = 'persistent-hit';
+                return userCache.payload;
+            }
+        } catch (error) {
+            console.warn('[baibaoku] Failed to restore settings payload cache from disk:', error.message);
+        }
     }
 
     metrics.payloadCache = userCache.payload ? 'stale' : 'miss';
@@ -671,6 +1046,8 @@ async function buildFastSettingsPayload(req, userHandle) {
     userCache.payloadDirtyReason = '';
     userCache.payloadDirtyAt = 0;
     userCache.payloadBuiltAt = Date.now();
+    userCache.payloadCacheKey = computeSettingsPayloadCacheKey(userCache, payload);
+    ensureSettingsPayloadPersisted(req, userHandle);
 
     return payload;
 }
@@ -698,37 +1075,81 @@ async function getStaticSettingsPayload() {
     return staticSettingsPayload;
 }
 
-function getFastSettingsResponse(userHandle, settingsInfo, cachedPayload, staticPayload, acceptsGzip, metrics = {}) {
-    const userCache = getSettingsUserCache(userHandle);
-    const key = [
-        settingsInfo.path,
-        settingsInfo.mtime,
-        settingsInfo.size,
-        settingsInfo.updatedAt,
-        userCache.payloadBuiltAt,
-    ].join('\0');
+async function getFastSettingsResponse(req, userHandle, settingsInfo, cachedPayload, staticPayload, acceptsGzip, metrics = {}) {
+    const key = getFastSettingsResponseKey(userHandle, settingsInfo, staticPayload);
     const cached = settingsResponseCaches.get(userHandle);
 
     if (cached?.key === key) {
         if (acceptsGzip) {
-            const gzipStartedAt = Date.now();
-            cached.gzipBuffer ??= zlib.gzipSync(cached.text, { level: 1 });
-            metrics.gzipMs = Date.now() - gzipStartedAt;
+            if (!cached.gzipBuffer && cached.text) {
+                const gzipStartedAt = Date.now();
+                cached.gzipBuffer = zlib.gzipSync(cached.text, { level: 1 });
+                metrics.gzipMs = Date.now() - gzipStartedAt;
+            }
+
+            if (!cached.gzipBuffer) {
+                return restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload, acceptsGzip, metrics);
+            }
 
             return {
                 cacheHit: true,
+                cacheStatus: 'hit',
                 encoding: 'gzip',
                 body: cached.gzipBuffer,
             };
         }
 
+        if (!cached.text) {
+            return restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload, acceptsGzip, metrics);
+        }
+
         return {
             cacheHit: true,
+            cacheStatus: 'hit',
             encoding: 'identity',
             body: cached.text,
         };
     }
 
+    return restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload, acceptsGzip, metrics);
+}
+
+async function restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload, acceptsGzip, metrics = {}) {
+    const restored = await restoreFastSettingsResponseCache(req, userHandle, key, acceptsGzip);
+    if (restored) {
+        return {
+            cacheHit: true,
+            cacheStatus: 'persistent-hit',
+            encoding: restored.encoding,
+            body: restored.body,
+        };
+    }
+
+    const nextCache = buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload, acceptsGzip, metrics);
+    settingsResponseCaches.set(userHandle, nextCache);
+    schedulePersistFastSettingsResponse(req, userHandle, nextCache);
+
+    return {
+        cacheHit: false,
+        cacheStatus: 'miss',
+        encoding: acceptsGzip ? 'gzip' : 'identity',
+        body: acceptsGzip ? nextCache.gzipBuffer : nextCache.text,
+    };
+}
+
+function getFastSettingsResponseKey(userHandle, settingsInfo, staticPayload) {
+    const userCache = getSettingsUserCache(userHandle);
+
+    return [
+        settingsInfo.path,
+        settingsInfo.mtime,
+        settingsInfo.size,
+        userCache.payloadCacheKey || userCache.payloadBuiltAt,
+        hashSettingsJson(staticPayload),
+    ].join('\0');
+}
+
+function buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload, acceptsGzip, metrics = {}) {
     const text = JSON.stringify({
         settings: settingsInfo.text,
         ...cachedPayload,
@@ -742,13 +1163,140 @@ function getFastSettingsResponse(userHandle, settingsInfo, cachedPayload, static
         metrics.gzipMs = Date.now() - gzipStartedAt;
     }
 
-    settingsResponseCaches.set(userHandle, nextCache);
+    return nextCache;
+}
 
-    return {
-        cacheHit: false,
-        encoding: acceptsGzip ? 'gzip' : 'identity',
-        body: acceptsGzip ? nextCache.gzipBuffer : text,
-    };
+async function restoreFastSettingsResponseCache(req, userHandle, key, acceptsGzip) {
+    let meta;
+
+    try {
+        meta = JSON.parse(await fs.promises.readFile(getSettingsResponseMetaPath(req), 'utf8'));
+    } catch {
+        return null;
+    }
+
+    if (meta?.version !== SETTINGS_RESPONSE_PERSIST_VERSION || meta.key !== key) {
+        return null;
+    }
+
+    if (acceptsGzip && meta.hasGzip) {
+        try {
+            const gzipBuffer = await fs.promises.readFile(getSettingsResponseGzipPath(req));
+            settingsResponseCaches.set(userHandle, { key, gzipBuffer });
+            return {
+                encoding: 'gzip',
+                body: gzipBuffer,
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    try {
+        const text = await fs.promises.readFile(getSettingsResponseBodyPath(req), 'utf8');
+        const cache = { key, text };
+        settingsResponseCaches.set(userHandle, cache);
+        return {
+            encoding: 'identity',
+            body: text,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function schedulePersistFastSettingsResponse(req, userHandle, responseCache) {
+    setTimeout(() => {
+        void persistFastSettingsResponseToDisk(req, userHandle, responseCache)
+            .catch((error) => {
+                console.warn('[baibaoku] Failed to persist settings response cache:', error.message);
+            });
+    }, 0);
+}
+
+async function persistFastSettingsResponseToDisk(req, userHandle, responseCache) {
+    if (!responseCache?.key || typeof responseCache.text !== 'string') {
+        return false;
+    }
+
+    if (settingsResponseCaches.get(userHandle)?.key !== responseCache.key) {
+        return false;
+    }
+
+    const gzipBuffer = responseCache.gzipBuffer || zlib.gzipSync(responseCache.text, { level: 1 });
+
+    await writeFileAtomicAsync(getSettingsResponseBodyPath(req), responseCache.text);
+    await writeFileAtomicAsync(getSettingsResponseGzipPath(req), gzipBuffer);
+    await writeFileAtomicAsync(getSettingsResponseMetaPath(req), JSON.stringify({
+        version: SETTINGS_RESPONSE_PERSIST_VERSION,
+        savedAt: Date.now(),
+        key: responseCache.key,
+        hasBody: true,
+        hasGzip: true,
+        bodyFile: SETTINGS_RESPONSE_BODY_FILE,
+        gzipFile: SETTINGS_RESPONSE_GZIP_FILE,
+    }));
+
+    return true;
+}
+
+function sameSettingsInfo(left, right) {
+    return Boolean(
+        left
+        && right
+        && left.path === right.path
+        && left.mtime === right.mtime
+        && left.size === right.size
+        && left.updatedAt === right.updatedAt,
+    );
+}
+
+function scheduleSettingsResponseWarmup(req, userHandle, reason = 'unknown') {
+    setTimeout(() => {
+        void warmSettingsResponseCache(req, userHandle, reason)
+            .catch((error) => {
+                console.warn(`[baibaoku] Failed to warm settings response cache after ${reason}:`, error.message);
+            });
+    }, 0);
+}
+
+async function warmSettingsResponseCache(req, userHandle) {
+    const userCache = getSettingsUserCache(userHandle);
+
+    if (!canUseCachedSettingsPayload(userCache)) {
+        return false;
+    }
+
+    const cachedPayload = userCache.payload;
+    const payloadBuiltAt = userCache.payloadBuiltAt;
+    const settingsInfo = await readSettingsTextWithCache(req, userHandle);
+
+    if (!canUseCachedSettingsPayload(userCache) || userCache.payload !== cachedPayload || userCache.payloadBuiltAt !== payloadBuiltAt) {
+        return false;
+    }
+
+    const staticPayload = await getStaticSettingsPayload();
+    const currentSettingsInfo = settingsFileCaches.get(userHandle);
+
+    if (!sameSettingsInfo(settingsInfo, currentSettingsInfo)) {
+        return false;
+    }
+
+    const key = getFastSettingsResponseKey(userHandle, settingsInfo, staticPayload);
+    const nextCache = buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload, true);
+
+    if (
+        !canUseCachedSettingsPayload(userCache)
+        || userCache.payload !== cachedPayload
+        || userCache.payloadBuiltAt !== payloadBuiltAt
+        || !sameSettingsInfo(settingsInfo, settingsFileCaches.get(userHandle))
+    ) {
+        return false;
+    }
+
+    settingsResponseCaches.set(userHandle, nextCache);
+    schedulePersistFastSettingsResponse(req, userHandle, nextCache);
+    return true;
 }
 
 function requestAcceptsGzip(req) {
@@ -1133,6 +1681,7 @@ export function registerStEndpoints(router, manager) {
                 res.set('X-Baibaoku-Save-Skipped', 'true');
             }
             res.json(result);
+            scheduleSettingsResponseWarmup(req, userHandle, result.skipped ? 'fast-save-skipped' : 'fast-save');
         } catch (error) {
             console.error('[baibaoku] Error in settings fast-save endpoint:', error);
             res.status(500).json({ error: true, message: error.message });
@@ -1154,7 +1703,7 @@ export function registerStEndpoints(router, manager) {
             const settingsPromise = readSettingsTextWithCache(req, userHandle)
                 .then((settingsInfo) => {
                     metrics.settingsMs = Date.now() - settingsStartedAt;
-                    metrics.settingsCache = settingsInfo.cacheHit ? 'hit' : 'miss';
+                    metrics.settingsCache = settingsInfo.cacheStatus || (settingsInfo.cacheHit ? 'hit' : 'miss');
                     return settingsInfo;
                 });
 
@@ -1172,13 +1721,15 @@ export function registerStEndpoints(router, manager) {
                 settingsUpdateLocks.get(userHandle),
             ]);
             metrics.payloadMs = Date.now() - payloadStartedAt;
+            ensureSettingsPayloadPersisted(req, userHandle);
 
             const staticStartedAt = Date.now();
             const staticPayload = await getStaticSettingsPayload();
             metrics.staticMs = Date.now() - staticStartedAt;
 
             const responseStartedAt = Date.now();
-            const response = getFastSettingsResponse(
+            const response = await getFastSettingsResponse(
+                req,
                 userHandle,
                 settingsInfo,
                 cachedPayload,
@@ -1187,7 +1738,7 @@ export function registerStEndpoints(router, manager) {
                 metrics,
             );
             metrics.responseMs = Date.now() - responseStartedAt;
-            metrics.responseCache = response.cacheHit ? 'hit' : 'miss';
+            metrics.responseCache = response.cacheStatus || (response.cacheHit ? 'hit' : 'miss');
             metrics.totalMs = Date.now() - startedAt;
 
             res.type('application/json; charset=utf-8');
