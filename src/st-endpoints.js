@@ -41,7 +41,7 @@ const settingsSaveLocks = new Map();
 // Cache structure: Map<userHandle, { key: string, text: string, gzipBuffer?: Buffer }>
 const settingsResponseCaches = new Map();
 let staticSettingsPayload = null;
-const EARLY_BRIDGE_VERSION = 3;
+const EARLY_BRIDGE_VERSION = '0.4';
 
 /**
  * Normalizes tags from V1/V2 char data structure.
@@ -1408,10 +1408,13 @@ function makeEarlyBridgeScript(options = {}) {
   state.fastGetPath = FAST_SETTINGS_GET;
   state.fastSavePath = FAST_SETTINGS_SAVE;
   state.fastCharacterListPath = FAST_CHARACTER_LIST;
-  state.requests = state.requests || { get: 0, save: 0, characters: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0 };
+  state.requests = state.requests || { get: 0, save: 0, characters: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
+  if (typeof state.requests.saveFrontendCache !== 'number') state.requests.saveFrontendCache = 0;
   state.rawFetch = rawFetch;
   state.settingsGetCache = state.settingsGetCache || null;
   state.settingsGetPending = null;
+  state.settingsSaveCache = state.settingsSaveCache || null;
+  state.settingsSavePending = null;
 
   function writeSettingsAccelerationEnabled(enabled) {
     var next = Boolean(enabled);
@@ -1484,11 +1487,30 @@ function makeEarlyBridgeScript(options = {}) {
     state.lastInvalidatedAt = Date.now();
   }
 
+  function clearSettingsSaveCache(reason) {
+    state.settingsSaveCache = null;
+    state.settingsSavePending = null;
+    state.lastSaveInvalidationReason = reason || 'unknown';
+    state.lastSaveInvalidatedAt = Date.now();
+  }
+
   function makeCachedSettingsGetResponse(cache, source) {
     var headers = new Headers(cache.headers || undefined);
     headers.set('content-type', 'application/json; charset=utf-8');
     headers.set('x-baibaoku-frontend-cache', source || 'hit');
     headers.set('x-baibaoku-frontend-cache-age-ms', String(Date.now() - cache.savedAt));
+    return new Response(cache.text, {
+      status: cache.status || 200,
+      statusText: cache.statusText || 'OK',
+      headers: headers,
+    });
+  }
+
+  function makeCachedSettingsSaveResponse(cache, source) {
+    var headers = new Headers(cache.headers || undefined);
+    headers.set('content-type', 'application/json; charset=utf-8');
+    headers.set('x-baibaoku-frontend-save-cache', source || 'hit');
+    headers.set('x-baibaoku-frontend-save-cache-age-ms', String(Date.now() - cache.savedAt));
     return new Response(cache.text, {
       status: cache.status || 200,
       statusText: cache.statusText || 'OK',
@@ -1514,6 +1536,30 @@ function makeEarlyBridgeScript(options = {}) {
     return state.settingsGetCache;
   }
 
+  async function cacheSettingsSaveResponse(response, saveKey) {
+    var text = await response.clone().text();
+    var headers = {};
+    response.headers.forEach(function (value, key) {
+      if (!/^content-encoding$/i.test(key) && !/^content-length$/i.test(key)) {
+        headers[key] = value;
+      }
+    });
+    var cache = {
+      key: saveKey,
+      text: text,
+      headers: headers,
+      status: response.status,
+      statusText: response.statusText,
+      ok: response.ok,
+      skipped: response.headers.get('x-baibaoku-save-skipped') === 'true',
+      savedAt: Date.now(),
+    };
+    if (response.ok) {
+      state.settingsSaveCache = cache;
+    }
+    return cache;
+  }
+
   async function getReplayBody(input, init, method) {
     if (method === 'GET' || method === 'HEAD') return undefined;
     if (init && Object.prototype.hasOwnProperty.call(init, 'body')) return init.body;
@@ -1529,6 +1575,32 @@ function makeEarlyBridgeScript(options = {}) {
     } catch (_) {
       return null;
     }
+  }
+
+  function parseJsonResult(text) {
+    try {
+      return { ok: true, value: JSON.parse(text) };
+    } catch (_) {
+      return { ok: false, value: null };
+    }
+  }
+
+  async function bodyToText(body) {
+    if (body === undefined || body === null) return '';
+    if (typeof body === 'string') return body;
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return body.toString();
+    if (typeof Blob !== 'undefined' && body instanceof Blob) return await body.text();
+    if (body instanceof ArrayBuffer) return new TextDecoder().decode(body);
+    if (ArrayBuffer.isView(body)) return new TextDecoder().decode(body);
+    return null;
+  }
+
+  async function getSettingsSaveKey(body) {
+    var text = await bodyToText(body);
+    if (text === null) return null;
+    var parsed = parseJsonResult(text || '{}');
+    if (!parsed.ok) return null;
+    return JSON.stringify(parsed.value == null ? {} : parsed.value, null, 4);
   }
 
   function isPlainEmptyObject(value) {
@@ -1602,6 +1674,9 @@ function makeEarlyBridgeScript(options = {}) {
       var originalResponse = await rawFetch(input, init);
       if (originalResponse && originalResponse.ok && shouldInvalidateSettingsGetCache(url, method)) {
         clearSettingsGetCache('mutation:' + url.pathname);
+        if (url.pathname === '/api/settings/save') {
+          clearSettingsSaveCache('mutation:' + url.pathname);
+        }
       }
       return originalResponse;
     }
@@ -1622,6 +1697,53 @@ function makeEarlyBridgeScript(options = {}) {
       }
 
       var fastInit = await makeFastInit(input, init, method);
+
+      if (route.kind === 'save') {
+        var saveKey = await getSettingsSaveKey(fastInit.body);
+        if (saveKey && state.settingsSavePending && state.settingsSavePending.key === saveKey) {
+          state.requests.frontendCache += 1;
+          state.requests.saveFrontendCache += 1;
+          var pendingSaveCache = await state.settingsSavePending.promise;
+          if (pendingSaveCache && pendingSaveCache.ok) {
+            return makeCachedSettingsSaveResponse(pendingSaveCache, 'pending');
+          }
+          return callOriginal(input, init);
+        }
+        if (saveKey && !state.settingsSavePending && state.settingsSaveCache && state.settingsSaveCache.key === saveKey) {
+          state.requests.frontendCache += 1;
+          state.requests.saveFrontendCache += 1;
+          return makeCachedSettingsSaveResponse(state.settingsSaveCache, 'hit');
+        }
+
+        var saveResponsePromise = rawFetch(route.fastPath, fastInit);
+        if (saveKey) {
+          var saveCachePromise = saveResponsePromise
+            .then(function (saveResponse) {
+              return cacheSettingsSaveResponse(saveResponse, saveKey);
+            })
+            .catch(function (error) {
+              state.requests.errors += 1;
+              state.lastSaveCacheError = error && error.message ? error.message : String(error);
+              return null;
+            })
+            .finally(function () {
+              if (state.settingsSavePending && state.settingsSavePending.key === saveKey) {
+                state.settingsSavePending = null;
+              }
+            });
+          state.settingsSavePending = { key: saveKey, promise: saveCachePromise };
+        }
+
+        var saveResponse = await saveResponsePromise;
+        if (saveResponse && saveResponse.ok) {
+          if (saveResponse.headers.get('x-baibaoku-save-skipped') !== 'true') {
+            clearSettingsGetCache('save');
+          }
+          return saveResponse;
+        }
+        return callOriginal(input, init);
+      }
+
       var response = await rawFetch(route.fastPath, fastInit);
       if (response && response.ok) {
         if (route.kind === 'get') {
@@ -1635,8 +1757,6 @@ function makeEarlyBridgeScript(options = {}) {
             .finally(function () {
               state.settingsGetPending = null;
             });
-        } else if (route.kind === 'save') {
-          clearSettingsGetCache('save');
         } else if (route.kind === 'characters') {
           var characterData = await response.clone().json().catch(function () { return null; });
           if (!Array.isArray(characterData)) {
