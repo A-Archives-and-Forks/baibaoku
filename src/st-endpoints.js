@@ -6,6 +6,13 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { parse } from '../../../src/character-card-parser.js';
 import { SETTINGS_FILE } from '../../../src/constants.js';
 import { PLUGIN_ID } from './constants.js';
+import {
+    getTiktokenTokenizer,
+    getTokenizerModel,
+    countWebTokenizerTokens,
+    getSentencepiceTokenizer,
+    getWebTokenizer,
+} from '../../../src/endpoints/tokenizers.js';
 
 const FAST_CHARACTER_CACHE_DATABASE = 'baibaoku.internal';
 const FAST_CHARACTER_CACHE_STORE = 'character-fast-all';
@@ -17,6 +24,7 @@ const SETTINGS_FAST_CONFIG_KEY = 'global';
 const DEFAULT_SETTINGS_ACCELERATION_ENABLED = true;
 const DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED = true;
+const DEFAULT_TOKENIZER_BULK_COUNT_ENABLED = true;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
 const SETTINGS_TEXT_PERSIST_VERSION = 1;
 const SETTINGS_TEXT_PERSIST_FILE = 'settings-text-v1.json';
@@ -1549,6 +1557,7 @@ async function getSettingsFastConfig(req, manager) {
         settingsAccelerationEnabled: value.settingsAccelerationEnabled !== false,
         characterListAccelerationEnabled: value.characterListAccelerationEnabled !== false,
         recentChatListAccelerationEnabled: value.recentChatListAccelerationEnabled !== false,
+        tokenizerBulkCountEnabled: value.tokenizerBulkCountEnabled !== false,
     };
 }
 
@@ -1565,6 +1574,9 @@ async function setSettingsFastConfig(req, manager) {
         recentChatListAccelerationEnabled: req.body?.recentChatListAccelerationEnabled === undefined
             ? current.recentChatListAccelerationEnabled !== false
             : req.body.recentChatListAccelerationEnabled !== false,
+        tokenizerBulkCountEnabled: req.body?.tokenizerBulkCountEnabled === undefined
+            ? current.tokenizerBulkCountEnabled !== false
+            : req.body.tokenizerBulkCountEnabled !== false,
     };
 
     await manager.set(
@@ -1588,6 +1600,7 @@ async function getSettingsFastConfigSafe(req, manager) {
             settingsAccelerationEnabled: DEFAULT_SETTINGS_ACCELERATION_ENABLED,
             characterListAccelerationEnabled: DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED,
             recentChatListAccelerationEnabled: DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED,
+            tokenizerBulkCountEnabled: DEFAULT_TOKENIZER_BULK_COUNT_ENABLED,
         };
     }
 }
@@ -1601,6 +1614,7 @@ function makeEarlyBridgeScript(options = {}) {
     const settingsAccelerationEnabled = options.settingsAccelerationEnabled !== false;
     const characterListAccelerationEnabled = options.characterListAccelerationEnabled !== false;
     const recentChatListAccelerationEnabled = options.recentChatListAccelerationEnabled !== false;
+    const tokenizerBulkCountEnabled = options.tokenizerBulkCountEnabled !== false;
 
     return `/* baibaoku early bridge v${EARLY_BRIDGE_VERSION} */
 (function () {
@@ -1615,6 +1629,7 @@ function makeEarlyBridgeScript(options = {}) {
   var SETTINGS_ACCELERATION_ENABLED = ${JSON.stringify(settingsAccelerationEnabled)};
   var CHARACTER_LIST_ACCELERATION_ENABLED = ${JSON.stringify(characterListAccelerationEnabled)};
   var RECENT_CHAT_LIST_ACCELERATION_ENABLED = ${JSON.stringify(recentChatListAccelerationEnabled)};
+  var TOKENIZER_BULK_COUNT_ENABLED = ${JSON.stringify(tokenizerBulkCountEnabled)};
 
   if (window[FLAG] && window[FLAG].installed) {
     return;
@@ -1681,6 +1696,17 @@ function makeEarlyBridgeScript(options = {}) {
   };
   state.setRecentChatListAccelerationEnabled = writeRecentChatListAccelerationEnabled;
   state.recentChatListAccelerationEnabled = RECENT_CHAT_LIST_ACCELERATION_ENABLED;
+
+  function writeTokenizerBulkCountEnabled(enabled) {
+    state.tokenizerBulkCountEnabled = Boolean(enabled);
+    return state.tokenizerBulkCountEnabled;
+  }
+
+  state.isTokenizerBulkCountEnabled = function () {
+    return state.tokenizerBulkCountEnabled !== false;
+  };
+  state.setTokenizerBulkCountEnabled = writeTokenizerBulkCountEnabled;
+  state.tokenizerBulkCountEnabled = TOKENIZER_BULK_COUNT_ENABLED;
 
   function toUrl(input) {
     try {
@@ -2064,6 +2090,73 @@ function makeEarlyBridgeScript(options = {}) {
 `;
 }
 
+/**
+ * Count tokens for a single message using the appropriate tokenizer.
+ * Mimics the per-message behavior of ST's /api/tokenizers/openai/count
+ * when called with a single-element array.
+ * @param {string} model - Raw query model name
+ * @param {string} resolvedModel - Resolved tokenizer model name
+ * @param {object} msg - Single message object
+ * @returns {Promise<number>} Token count for this message
+ */
+async function countSingleMessageBulk(model, resolvedModel, msg) {
+    // 1. WebTokenizer models (claude, llama3, deepseek, qwen2, command-r/a, nemo)
+    const webTokenizer = getWebTokenizer(resolvedModel);
+    if (webTokenizer) {
+        const instance = await webTokenizer.get();
+        if (instance) return countWebTokenizerTokens(instance, [msg]);
+        return guesstimateBulk(JSON.stringify([msg]));
+    }
+
+    // 2. SentencePiece models (llama, mistral, yi, gemma, jamba, nerdstash)
+    const sppTokenizer = getSentencepiceTokenizer(resolvedModel);
+    if (sppTokenizer) {
+        return await countSentencepieceArrayTokensBulk(sppTokenizer, [msg]);
+    }
+
+    // 3. Default: tiktoken models (gpt-3.5, gpt-4, gpt-4o, o1, etc.)
+    const tokensPerName = model.includes('gpt-3.5-turbo-0301') ? -1 : 1;
+    const tokensPerMessage = model.includes('gpt-3.5-turbo-0301') ? 4 : 3;
+    const tokensPadding = 3;
+    const tokenizer = getTiktokenTokenizer(resolvedModel);
+
+    let count = tokensPerMessage + tokensPadding;
+    for (const [key, value] of Object.entries(msg)) {
+        count += tokenizer.encode(String(value ?? '')).length;
+        if (key === 'name') count += tokensPerName;
+    }
+    if (model.includes('gpt-3.5-turbo-0301')) count += 9;
+    return count;
+}
+
+async function countSentencepieceArrayTokensBulk(tokenizer, array) {
+    const jsonBody = array.flatMap(x => Object.values(x)).join('\n\n');
+    const result = await countSentencepieceTokensBulk(tokenizer, jsonBody);
+    return result.count;
+}
+
+async function countSentencepieceTokensBulk(tokenizer, text) {
+    const instance = await tokenizer?.get();
+
+    if (!instance) {
+        return {
+            ids: [],
+            count: guesstimateBulk(text),
+        };
+    }
+
+    const ids = instance.encodeIds(text);
+    return {
+        ids,
+        count: ids.length,
+    };
+}
+
+function guesstimateBulk(str) {
+    const byteLength = Buffer.byteLength(str, 'utf8');
+    return Math.ceil(byteLength / 3.35);
+}
+
 export function closeStEndpointCaches() {
     for (const userCache of settingsUserCaches.values()) {
         for (const watcher of userCache.payloadWatchers?.values() || []) {
@@ -2300,6 +2393,31 @@ export function registerStEndpoints(router, manager) {
         } catch (error) {
             console.error('[baibaoku] Error in settings fast-get endpoint:', error);
             res.status(500).json({ error: true, message: error.message });
+        }
+    });
+
+    router.post('/v1/tokenizers/bulk-count', async (req, res) => {
+        try {
+            const model = String(req.body?.model || 'gpt-3.5-turbo');
+            const messages = req.body?.messages;
+            if (!Array.isArray(messages) || messages.length === 0) {
+                return res.status(400).json({ ok: false, error: { message: 'messages must be a non-empty array' } });
+            }
+
+            const resolvedModel = getTokenizerModel(model);
+            const counts = await Promise.all(messages.map(msg =>
+                countSingleMessageBulk(model, resolvedModel, msg)));
+
+            res.json({
+                ok: true,
+                data: {
+                    counts,
+                    token_count: counts.reduce((a, b) => a + b, 0),
+                },
+            });
+        } catch (error) {
+            console.error('[baibaoku] Error in bulk-count endpoint:', error);
+            res.status(500).json({ ok: false, error: { message: error.message } });
         }
     });
 }
