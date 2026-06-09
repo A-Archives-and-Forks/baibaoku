@@ -1353,10 +1353,8 @@ function getRequestAcceptedEncodings(req) {
 
 function getFastSettingsResponseEncoding(req) {
     const accepted = getRequestAcceptedEncodings(req);
-    const clientIp = getRequestClientIp(req);
-    const isLocalNetwork = isLocalOrPrivateIp(clientIp);
 
-    if (!isLocalNetwork && accepted.br) {
+    if (accepted.br) {
         return 'br';
     }
 
@@ -1364,99 +1362,7 @@ function getFastSettingsResponseEncoding(req) {
         return 'gzip';
     }
 
-    if (accepted.br) {
-        return 'br';
-    }
-
     return 'identity';
-}
-
-function getRequestClientIp(req) {
-    const forwardedFor = String(req.headers?.['x-forwarded-for'] || '').split(',')[0];
-    const forwarded = parseForwardedHeaderClientIp(req.headers?.forwarded);
-
-    return normalizeClientIp(
-        forwardedFor
-        || req.headers?.['x-real-ip']
-        || forwarded
-        || req.ip
-        || req.socket?.remoteAddress
-        || req.connection?.remoteAddress
-        || '',
-    );
-}
-
-function parseForwardedHeaderClientIp(value) {
-    const match = String(value || '').match(/(?:^|[;,]\s*)for=(?:"?\[?)([^";,\]\s]+)(?:\]?"?)?/i);
-    return match ? match[1] : '';
-}
-
-function normalizeClientIp(value) {
-    let ip = String(value || '').trim();
-
-    if (!ip) {
-        return '';
-    }
-
-    ip = ip.replace(/^"|"$/g, '');
-
-    if (ip.startsWith('[')) {
-        const bracketEnd = ip.indexOf(']');
-        if (bracketEnd !== -1) {
-            ip = ip.slice(1, bracketEnd);
-        }
-    } else if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(ip)) {
-        ip = ip.replace(/:\d+$/, '');
-    }
-
-    if (ip.toLowerCase().startsWith('::ffff:')) {
-        ip = ip.slice(7);
-    }
-
-    return ip.toLowerCase();
-}
-
-function isLocalOrPrivateIp(ip) {
-    if (!ip) {
-        return true;
-    }
-
-    if (ip === 'localhost' || ip === '::1' || ip === '0:0:0:0:0:0:0:1') {
-        return true;
-    }
-
-    const ipv4 = parseIpv4(ip);
-    if (ipv4) {
-        const [first, second] = ipv4;
-        return first === 10
-            || first === 127
-            || (first === 172 && second >= 16 && second <= 31)
-            || (first === 192 && second === 168)
-            || (first === 169 && second === 254);
-    }
-
-    return ip.startsWith('fc')
-        || ip.startsWith('fd')
-        || ip.startsWith('fe80:')
-        || ip === '::';
-}
-
-function parseIpv4(value) {
-    const parts = String(value || '').split('.');
-    if (parts.length !== 4) {
-        return null;
-    }
-
-    const numbers = parts.map((part) => {
-        if (!/^\d{1,3}$/.test(part)) {
-            return NaN;
-        }
-        return Number(part);
-    });
-
-    return numbers.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
-        ? numbers
-        : null;
 }
 
 async function getSettingsFastConfig(req, manager) {
