@@ -5,6 +5,7 @@ import bytes from 'bytes';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { parse } from '../../../src/character-card-parser.js';
 import { SETTINGS_FILE } from '../../../src/constants.js';
+import { generateTimestamp, removeOldBackups } from '../../../src/util.js';
 import { PLUGIN_ID } from './constants.js';
 import {
     getTiktokenTokenizer,
@@ -26,6 +27,7 @@ const DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = true;
 const DEFAULT_TOKENIZER_BULK_COUNT_ENABLED = true;
+const SETTINGS_AUTOSAVE_INTERVAL = 10 * 60 * 1000;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
 const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
 const FAST_CHAT_GET_DEFAULT_INITIAL_MESSAGES = 5;
@@ -51,6 +53,10 @@ const settingsFileCaches = new Map();
 const settingsSaveLocks = new Map();
 // Cache structure: Map<userHandle, { key: string, text: string }>
 const settingsResponseCaches = new Map();
+// Scheduler structure: Map<userHandle, { lastBackupAt: number, timer: Timeout|null, pendingPayload: Object|null }>
+const settingsBackupSchedulers = new Map();
+// Cache structure: Map<userHandle, string>
+const lastBackupTexts = new Map();
 let staticSettingsPayload = null;
 const EARLY_BRIDGE_VERSION = '0.5';
 
@@ -1060,6 +1066,109 @@ async function saveSettingsWithCache(req, userHandle) {
     schedulePersistSettingsText(req, userHandle);
 
     return { result: 'ok' };
+}
+
+function getSettingsBackupFilePrefix(userHandle) {
+    return `settings_${userHandle}_`;
+}
+
+function getSettingsBackupPayload(req, userHandle) {
+    const directories = req.user?.directories;
+    if (!directories?.backups || !directories?.root) {
+        return null;
+    }
+
+    return {
+        userHandle,
+        backupDir: directories.backups,
+        settingsPath: path.join(directories.root, SETTINGS_FILE),
+    };
+}
+
+function getSettingsBackupScheduler(userHandle) {
+    if (!settingsBackupSchedulers.has(userHandle)) {
+        settingsBackupSchedulers.set(userHandle, {
+            lastBackupAt: 0,
+            timer: null,
+            pendingPayload: null,
+        });
+    }
+
+    return settingsBackupSchedulers.get(userHandle);
+}
+
+function scheduleSettingsAutoBackup(req, userHandle) {
+    const payload = getSettingsBackupPayload(req, userHandle);
+    if (!payload) {
+        return;
+    }
+
+    const scheduler = getSettingsBackupScheduler(userHandle);
+    const now = Date.now();
+    const elapsed = now - scheduler.lastBackupAt;
+
+    if (!scheduler.timer && elapsed >= SETTINGS_AUTOSAVE_INTERVAL) {
+        scheduler.lastBackupAt = now;
+        scheduler.timer = setTimeout(() => runScheduledSettingsBackup(userHandle, payload), 0);
+        return;
+    }
+
+    scheduler.pendingPayload = payload;
+
+    if (!scheduler.timer) {
+        const delay = Math.max(0, SETTINGS_AUTOSAVE_INTERVAL - elapsed);
+        scheduler.timer = setTimeout(() => runScheduledSettingsBackup(userHandle), delay);
+    }
+}
+
+async function runScheduledSettingsBackup(userHandle, immediatePayload = null) {
+    const scheduler = settingsBackupSchedulers.get(userHandle);
+    if (!scheduler) {
+        return;
+    }
+
+    scheduler.timer = null;
+
+    const payload = immediatePayload || scheduler.pendingPayload;
+    if (!immediatePayload) {
+        scheduler.pendingPayload = null;
+    }
+
+    if (!payload) {
+        return;
+    }
+
+    scheduler.lastBackupAt = Date.now();
+
+    try {
+        await backupSettingsIfChanged(payload);
+    } catch (error) {
+        console.warn('[baibaoku] Settings backup failed:', error.message);
+    } finally {
+        if (scheduler.pendingPayload && !scheduler.timer) {
+            scheduler.timer = setTimeout(() => runScheduledSettingsBackup(userHandle), SETTINGS_AUTOSAVE_INTERVAL);
+        }
+    }
+}
+
+async function backupSettingsIfChanged(payload) {
+    const { backupDir, settingsPath, userHandle } = payload;
+    const cached = settingsFileCaches.get(userHandle);
+    if (cached?.path !== settingsPath || typeof cached.text !== 'string') {
+        return;
+    }
+
+    const text = cached.text;
+    if (lastBackupTexts.get(userHandle) === text) {
+        return;
+    }
+
+    await fs.promises.mkdir(backupDir, { recursive: true });
+
+    const backupFile = path.join(backupDir, `${getSettingsBackupFilePrefix(userHandle)}${generateTimestamp()}.json`);
+    await fs.promises.copyFile(settingsPath, backupFile);
+    removeOldBackups(backupDir, `settings_${userHandle}`);
+    lastBackupTexts.set(userHandle, text);
 }
 
 function getSettingsUserCache(userHandle) {
@@ -2495,6 +2604,13 @@ export function closeStEndpointCaches() {
     settingsFileCaches.clear();
     settingsSaveLocks.clear();
     settingsResponseCaches.clear();
+    for (const scheduler of settingsBackupSchedulers.values()) {
+        if (scheduler.timer) {
+            clearTimeout(scheduler.timer);
+        }
+    }
+    settingsBackupSchedulers.clear();
+    lastBackupTexts.clear();
 }
 
 export function registerStEndpoints(router, manager) {
@@ -2658,6 +2774,11 @@ export function registerStEndpoints(router, manager) {
             }
             res.json(result);
             scheduleSettingsResponseWarmup(req, userHandle, result.skipped ? 'fast-save-skipped' : 'fast-save');
+
+            // Trigger backup after responding; the backup task is throttled and non-blocking.
+            if (!result.skipped) {
+                scheduleSettingsAutoBackup(req, userHandle);
+            }
         } catch (error) {
             console.error('[baibaoku] Error in settings fast-save endpoint:', error);
             res.status(500).json({ error: true, message: error.message });
