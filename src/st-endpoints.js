@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import bytes from 'bytes';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
@@ -24,13 +23,6 @@ const SETTINGS_PAYLOAD_PERSIST_FILE = 'settings-payload-v1.json';
 const SETTINGS_RESPONSE_PERSIST_VERSION = 1;
 const SETTINGS_RESPONSE_META_FILE = 'settings-response-v1.json';
 const SETTINGS_RESPONSE_BODY_FILE = 'settings-response-v1.body';
-const SETTINGS_RESPONSE_GZIP_FILE = 'settings-response-v1.gzip';
-const SETTINGS_RESPONSE_BR_FILE = 'settings-response-v1.br';
-const BROTLI_FAST_OPTIONS = {
-    params: {
-        [zlib.constants.BROTLI_PARAM_QUALITY]: 4,
-    },
-};
 
 // Cache structure: Map<userHandle, Map<filename, { mtime: number, size: number, data: Object }>>
 const userCaches = new Map();
@@ -44,7 +36,7 @@ const settingsUpdateLocks = new Map();
 const settingsFileCaches = new Map();
 // Lock structure: Map<userHandle, Promise<Object>>
 const settingsSaveLocks = new Map();
-// Cache structure: Map<userHandle, { key: string, text?: string, gzipBuffer?: Buffer, brBuffer?: Buffer }>
+// Cache structure: Map<userHandle, { key: string, text: string }>
 const settingsResponseCaches = new Map();
 let staticSettingsPayload = null;
 const EARLY_BRIDGE_VERSION = '0.4';
@@ -294,14 +286,6 @@ function getSettingsResponseMetaPath(req) {
 
 function getSettingsResponseBodyPath(req) {
     return path.join(getBaibaokuCacheDirectory(req), SETTINGS_RESPONSE_BODY_FILE);
-}
-
-function getSettingsResponseGzipPath(req) {
-    return path.join(getBaibaokuCacheDirectory(req), SETTINGS_RESPONSE_GZIP_FILE);
-}
-
-function getSettingsResponseBrPath(req) {
-    return path.join(getBaibaokuCacheDirectory(req), SETTINGS_RESPONSE_BR_FILE);
 }
 
 function cacheSettingsText(userHandle, settingsPath, text, stat) {
@@ -1086,47 +1070,42 @@ async function getStaticSettingsPayload() {
     return staticSettingsPayload;
 }
 
-async function getFastSettingsResponse(req, userHandle, settingsInfo, cachedPayload, staticPayload, encoding, metrics = {}) {
+async function getFastSettingsResponse(req, userHandle, settingsInfo, cachedPayload, staticPayload) {
     const key = getFastSettingsResponseKey(userHandle, settingsInfo, staticPayload);
     const cached = settingsResponseCaches.get(userHandle);
 
-    if (cached?.key === key) {
-        const body = getFastSettingsResponseBody(cached, encoding, metrics);
-        if (body !== null) {
-            return {
-                cacheHit: true,
-                cacheStatus: 'hit',
-                encoding,
-                body,
-            };
-        }
-
-        return restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload, encoding, metrics);
+    if (cached?.key === key && typeof cached.text === 'string') {
+        return {
+            cacheHit: true,
+            cacheStatus: 'hit',
+            encoding: 'identity',
+            body: cached.text,
+        };
     }
 
-    return restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload, encoding, metrics);
+    return restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload);
 }
 
-async function restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload, encoding, metrics = {}) {
-    const restored = await restoreFastSettingsResponseCache(req, userHandle, key, encoding, metrics);
+async function restoreOrBuildFastSettingsResponseCache(req, userHandle, key, settingsInfo, cachedPayload, staticPayload) {
+    const restored = await restoreFastSettingsResponseCache(req, userHandle, key);
     if (restored) {
         return {
             cacheHit: true,
             cacheStatus: 'persistent-hit',
-            encoding: restored.encoding,
-            body: restored.body,
+            encoding: 'identity',
+            body: restored.text,
         };
     }
 
-    const nextCache = buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload, encoding, metrics);
+    const nextCache = buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload);
     settingsResponseCaches.set(userHandle, nextCache);
     schedulePersistFastSettingsResponse(req, userHandle, nextCache);
 
     return {
         cacheHit: false,
         cacheStatus: 'miss',
-        encoding,
-        body: getFastSettingsResponseBody(nextCache, encoding, metrics),
+        encoding: 'identity',
+        body: nextCache.text,
     };
 }
 
@@ -1142,48 +1121,17 @@ function getFastSettingsResponseKey(userHandle, settingsInfo, staticPayload) {
     ].join('\0');
 }
 
-function buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload, encoding, metrics = {}) {
+function buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload) {
     const text = JSON.stringify({
         settings: settingsInfo.text,
         ...cachedPayload,
         ...staticPayload,
     });
-    const nextCache = { key, text };
 
-    getFastSettingsResponseBody(nextCache, encoding, metrics);
-
-    return nextCache;
+    return { key, text };
 }
 
-function getFastSettingsResponseBody(responseCache, encoding, metrics = {}) {
-    if (encoding === 'identity') {
-        return typeof responseCache.text === 'string' ? responseCache.text : null;
-    }
-
-    if (encoding === 'gzip') {
-        if (!responseCache.gzipBuffer && typeof responseCache.text === 'string') {
-            const startedAt = Date.now();
-            responseCache.gzipBuffer = zlib.gzipSync(responseCache.text, { level: 1 });
-            metrics.gzipMs = Date.now() - startedAt;
-            metrics.compressMs = (metrics.compressMs || 0) + metrics.gzipMs;
-        }
-        return responseCache.gzipBuffer || null;
-    }
-
-    if (encoding === 'br') {
-        if (!responseCache.brBuffer && typeof responseCache.text === 'string') {
-            const startedAt = Date.now();
-            responseCache.brBuffer = zlib.brotliCompressSync(responseCache.text, BROTLI_FAST_OPTIONS);
-            metrics.brMs = Date.now() - startedAt;
-            metrics.compressMs = (metrics.compressMs || 0) + metrics.brMs;
-        }
-        return responseCache.brBuffer || null;
-    }
-
-    return null;
-}
-
-async function restoreFastSettingsResponseCache(req, userHandle, key, encoding, metrics = {}) {
+async function restoreFastSettingsResponseCache(req, userHandle, key) {
     let meta;
 
     try {
@@ -1196,49 +1144,11 @@ async function restoreFastSettingsResponseCache(req, userHandle, key, encoding, 
         return null;
     }
 
-    if (encoding === 'gzip' && meta.hasGzip) {
-        try {
-            const gzipBuffer = await fs.promises.readFile(getSettingsResponseGzipPath(req));
-            settingsResponseCaches.set(userHandle, { key, gzipBuffer });
-            return {
-                encoding: 'gzip',
-                body: gzipBuffer,
-            };
-        } catch {
-            // Fall through to the persisted plain body if the compressed sidecar is missing.
-        }
-    }
-
-    if (encoding === 'br' && meta.hasBr) {
-        try {
-            const brBuffer = await fs.promises.readFile(getSettingsResponseBrPath(req));
-            settingsResponseCaches.set(userHandle, { key, brBuffer });
-            return {
-                encoding: 'br',
-                body: brBuffer,
-            };
-        } catch {
-            // Fall through to the persisted plain body if the compressed sidecar is missing.
-        }
-    }
-
     try {
         const text = await fs.promises.readFile(getSettingsResponseBodyPath(req), 'utf8');
         const cache = { key, text };
-        const body = getFastSettingsResponseBody(cache, encoding, metrics);
-
-        if (body === null) {
-            return null;
-        }
-
         settingsResponseCaches.set(userHandle, cache);
-        if (encoding !== 'identity') {
-            schedulePersistFastSettingsResponse(req, userHandle, cache);
-        }
-        return {
-            encoding,
-            body,
-        };
+        return cache;
     } catch {
         return null;
     }
@@ -1262,22 +1172,13 @@ async function persistFastSettingsResponseToDisk(req, userHandle, responseCache)
         return false;
     }
 
-    const gzipBuffer = responseCache.gzipBuffer || zlib.gzipSync(responseCache.text, { level: 1 });
-    const brBuffer = responseCache.brBuffer || zlib.brotliCompressSync(responseCache.text, BROTLI_FAST_OPTIONS);
-
     await writeFileAtomicAsync(getSettingsResponseBodyPath(req), responseCache.text);
-    await writeFileAtomicAsync(getSettingsResponseGzipPath(req), gzipBuffer);
-    await writeFileAtomicAsync(getSettingsResponseBrPath(req), brBuffer);
     await writeFileAtomicAsync(getSettingsResponseMetaPath(req), JSON.stringify({
         version: SETTINGS_RESPONSE_PERSIST_VERSION,
         savedAt: Date.now(),
         key: responseCache.key,
         hasBody: true,
-        hasGzip: true,
-        hasBr: true,
         bodyFile: SETTINGS_RESPONSE_BODY_FILE,
-        gzipFile: SETTINGS_RESPONSE_GZIP_FILE,
-        brFile: SETTINGS_RESPONSE_BR_FILE,
     }));
 
     return true;
@@ -1326,7 +1227,7 @@ async function warmSettingsResponseCache(req, userHandle) {
     }
 
     const key = getFastSettingsResponseKey(userHandle, settingsInfo, staticPayload);
-    const nextCache = buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload, 'gzip');
+    const nextCache = buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload);
 
     if (
         !canUseCachedSettingsPayload(userCache)
@@ -1340,29 +1241,6 @@ async function warmSettingsResponseCache(req, userHandle) {
     settingsResponseCaches.set(userHandle, nextCache);
     schedulePersistFastSettingsResponse(req, userHandle, nextCache);
     return true;
-}
-
-function getRequestAcceptedEncodings(req) {
-    const acceptEncoding = String(req.headers?.['accept-encoding'] || '');
-
-    return {
-        br: /\bbr\b/i.test(acceptEncoding),
-        gzip: /\bgzip\b/i.test(acceptEncoding),
-    };
-}
-
-function getFastSettingsResponseEncoding(req) {
-    const accepted = getRequestAcceptedEncodings(req);
-
-    if (accepted.br) {
-        return 'br';
-    }
-
-    if (accepted.gzip) {
-        return 'gzip';
-    }
-
-    return 'identity';
 }
 
 async function getSettingsFastConfig(req, manager) {
@@ -2069,20 +1947,13 @@ export function registerStEndpoints(router, manager) {
                 settingsInfo,
                 cachedPayload,
                 staticPayload,
-                getFastSettingsResponseEncoding(req),
-                metrics,
             );
             metrics.responseMs = Date.now() - responseStartedAt;
             metrics.responseCache = response.cacheStatus || (response.cacheHit ? 'hit' : 'miss');
             metrics.totalMs = Date.now() - startedAt;
 
             res.type('application/json; charset=utf-8');
-            res.set('Cache-Control', 'no-store, no-transform');
-            res.set('Vary', 'Accept-Encoding');
-            if (response.encoding !== 'identity') {
-                res.set('Content-Encoding', response.encoding);
-            }
-            res.set('Content-Length', String(response.body.length));
+            res.set('Cache-Control', 'no-cache');
             res.set('X-Baibaoku-Elapsed-Ms', String(metrics.totalMs));
             res.set('X-Baibaoku-Settings-Cache', metrics.settingsCache);
             res.set('X-Baibaoku-Payload-Cache', metrics.payloadCache);
@@ -2097,9 +1968,6 @@ export function registerStEndpoints(router, manager) {
                 `payload;dur=${metrics.payloadMs}`,
                 `static;dur=${metrics.staticMs}`,
                 `response;dur=${metrics.responseMs}`,
-                `compress;dur=${metrics.compressMs || 0}`,
-                `gzip;dur=${metrics.gzipMs || 0}`,
-                `br;dur=${metrics.brMs || 0}`,
                 `total;dur=${metrics.totalMs}`,
             ].join(', '));
             res.send(response.body);
