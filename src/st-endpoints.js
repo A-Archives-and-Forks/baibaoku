@@ -24,8 +24,11 @@ const SETTINGS_FAST_CONFIG_KEY = 'global';
 const DEFAULT_SETTINGS_ACCELERATION_ENABLED = true;
 const DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED = true;
+const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = true;
 const DEFAULT_TOKENIZER_BULK_COUNT_ENABLED = true;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
+const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
+const FAST_CHAT_GET_DEFAULT_INITIAL_MESSAGES = 5;
 const SETTINGS_TEXT_PERSIST_VERSION = 1;
 const SETTINGS_TEXT_PERSIST_FILE = 'settings-text-v1.json';
 const SETTINGS_PAYLOAD_PERSIST_VERSION = 1;
@@ -549,6 +552,324 @@ function parseJsonLine(line) {
     } catch {
         return null;
     }
+}
+
+async function getFastChatGet(req) {
+    const userHandle = req.user?.profile?.handle;
+    if (!userHandle) {
+        const error = new Error('Unauthorized');
+        error.status = 401;
+        throw error;
+    }
+
+    const source = String(req.body?.source || '');
+    const mode = req.body?.mode === 'full' ? 'full' : 'initial';
+    const originalRequest = req.body?.originalRequest && typeof req.body.originalRequest === 'object'
+        ? req.body.originalRequest
+        : {};
+    const thresholdBytes = normalizeFastChatThresholdBytes(req.body?.thresholdBytes);
+    const initialMessages = normalizeFastChatInitialMessages(req.body?.initialMessages);
+    const chatFile = resolveFastChatFile(req, source, originalRequest);
+    const startedAt = Date.now();
+
+    if (!chatFile?.filePath) {
+        const error = new Error('Unsupported chat source');
+        error.status = 400;
+        throw error;
+    }
+
+    let stats = null;
+    try {
+        stats = await fs.promises.stat(chatFile.filePath);
+    } catch {
+        return buildFastChatResponse({
+            kind: 'complete',
+            chat: [],
+            source,
+            chatKey: chatFile.chatKey,
+            stats: { size: 0, mtimeMs: 0 },
+            totalMessages: 0,
+            returnedMessages: 0,
+            messageStartIndex: 0,
+            elapsedMs: Date.now() - startedAt,
+        });
+    }
+
+    if (stats.size <= 0) {
+        return buildFastChatResponse({
+            kind: 'complete',
+            chat: [],
+            source,
+            chatKey: chatFile.chatKey,
+            stats,
+            totalMessages: 0,
+            returnedMessages: 0,
+            messageStartIndex: 0,
+            elapsedMs: Date.now() - startedAt,
+        });
+    }
+
+    if (mode === 'full' || stats.size <= thresholdBytes) {
+        const chat = await readFullJsonlChat(chatFile.filePath);
+        const totalMessages = countChatMessages(chat);
+        return buildFastChatResponse({
+            kind: mode === 'full' ? 'full' : 'complete',
+            chat,
+            source,
+            chatKey: chatFile.chatKey,
+            stats,
+            totalMessages,
+            returnedMessages: totalMessages,
+            messageStartIndex: 0,
+            elapsedMs: Date.now() - startedAt,
+        });
+    }
+
+    const partial = await readPartialJsonlChat(chatFile.filePath, stats.size, initialMessages);
+    return buildFastChatResponse({
+        kind: 'partial',
+        chat: partial.chat,
+        source,
+        chatKey: chatFile.chatKey,
+        stats,
+        totalMessages: partial.totalMessages,
+        returnedMessages: partial.returnedMessages,
+        messageStartIndex: partial.messageStartIndex,
+        elapsedMs: Date.now() - startedAt,
+    });
+}
+
+function normalizeFastChatThresholdBytes(value) {
+    const threshold = Number(value);
+    return Number.isFinite(threshold) && threshold > 0
+        ? Math.floor(threshold)
+        : FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES;
+}
+
+function normalizeFastChatInitialMessages(value) {
+    const count = Number(value);
+    return Number.isInteger(count) && count > 0
+        ? Math.min(count, 500)
+        : FAST_CHAT_GET_DEFAULT_INITIAL_MESSAGES;
+}
+
+function resolveFastChatFile(req, source, originalRequest) {
+    const directories = req.user?.directories || {};
+
+    if (source === '/api/chats/get') {
+        const chatsDir = directories.chats;
+        const avatarUrl = String(originalRequest.avatar_url || '');
+        const fileName = String(originalRequest.file_name || '');
+        if (!chatsDir || !avatarUrl || !fileName) {
+            return null;
+        }
+
+        const characterDir = sanitizeFastChatPathSegment(avatarUrl.replace('.png', ''));
+        const chatFileName = sanitizeFastChatPathSegment(`${fileName}.jsonl`);
+        const filePath = path.join(chatsDir, characterDir, chatFileName);
+        if (!isFastChatPathUnderParent(chatsDir, filePath)) {
+            return null;
+        }
+
+        return {
+            filePath,
+            chatKey: getFastChatKey(req, filePath),
+        };
+    }
+
+    if (source === '/api/chats/group/get') {
+        const groupChatsDir = directories.groupChats;
+        const id = String(originalRequest.id || '');
+        if (!groupChatsDir || !id) {
+            return null;
+        }
+
+        const filePath = path.join(groupChatsDir, sanitizeFastChatPathSegment(`${id}.jsonl`));
+        if (!isFastChatPathUnderParent(groupChatsDir, filePath)) {
+            return null;
+        }
+
+        return {
+            filePath,
+            chatKey: getFastChatKey(req, filePath),
+        };
+    }
+
+    return null;
+}
+
+function sanitizeFastChatPathSegment(value) {
+    return path.basename(String(value || ''))
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+        .trim();
+}
+
+function isFastChatPathUnderParent(parent, target) {
+    const relative = path.relative(path.resolve(parent), path.resolve(target));
+    return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+function getFastChatKey(req, filePath) {
+    const root = req.user?.directories?.root;
+    const relative = root
+        ? path.relative(root, filePath)
+        : filePath;
+    return relative.replaceAll(path.sep, '/');
+}
+
+async function readFullJsonlChat(filePath) {
+    const text = await fs.promises.readFile(filePath, 'utf8');
+    if (!text) {
+        return [];
+    }
+
+    return text
+        .split('\n')
+        .map(line => parseJsonLine(line))
+        .filter(Boolean);
+}
+
+async function readPartialJsonlChat(filePath, fileSize, initialMessages) {
+    const fileHandle = await fs.promises.open(filePath, 'r');
+
+    try {
+        const scan = await scanJsonlTailRanges(fileHandle, fileSize, initialMessages);
+        const firstLineText = scan.firstLineRange
+            ? await readFileRangeAsUtf8(fileHandle, scan.firstLineRange.start, scan.firstLineRange.length)
+            : '';
+        const firstJson = parseJsonLine(firstLineText);
+        const hasHeader = Boolean(firstJson?.chat_metadata && typeof firstJson.chat_metadata === 'object');
+        const tailRanges = hasHeader ? scan.tailMessageRanges : scan.tailAllRanges;
+        const totalMessages = hasHeader
+            ? Math.max(0, scan.lineCounter - 1)
+            : scan.lineCounter;
+        const messageStartIndex = Math.max(0, totalMessages - tailRanges.length);
+        const chat = [];
+
+        if (hasHeader) {
+            chat.push(firstJson);
+        }
+
+        for (const range of tailRanges) {
+            const text = await readFileRangeAsUtf8(fileHandle, range.start, range.length);
+            const json = parseJsonLine(text);
+            if (json) {
+                chat.push(json);
+            }
+        }
+
+        return {
+            chat,
+            totalMessages,
+            returnedMessages: tailRanges.length,
+            messageStartIndex,
+        };
+    } finally {
+        await fileHandle.close();
+    }
+}
+
+async function scanJsonlTailRanges(fileHandle, fileSize, tailLimit) {
+    const buffer = Buffer.allocUnsafe(FAST_RECENT_CHAT_READ_BUFFER_SIZE);
+    let lineCounter = 0;
+    let position = 0;
+    let lineStart = 0;
+    let firstLineRange = null;
+    let lastByte = null;
+    const tailAllRanges = [];
+    const tailMessageRanges = [];
+
+    const pushTail = (queue, range) => {
+        queue.push(range);
+        while (queue.length > tailLimit) {
+            queue.shift();
+        }
+    };
+
+    const finishLine = (end) => {
+        const range = {
+            start: lineStart,
+            length: Math.max(0, end - lineStart),
+        };
+
+        if (!firstLineRange) {
+            firstLineRange = range;
+        }
+
+        if (range.length > 0) {
+            pushTail(tailAllRanges, range);
+            if (lineCounter > 0) {
+                pushTail(tailMessageRanges, range);
+            }
+        }
+
+        lineCounter += 1;
+        lineStart = end + 1;
+    };
+
+    while (position < fileSize) {
+        const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) {
+            break;
+        }
+
+        const chunk = buffer.subarray(0, bytesRead);
+        let searchOffset = 0;
+        let newlineOffset;
+
+        while ((newlineOffset = chunk.indexOf(10, searchOffset)) !== -1) {
+            finishLine(position + newlineOffset);
+            searchOffset = newlineOffset + 1;
+        }
+
+        lastByte = chunk[bytesRead - 1];
+        position += bytesRead;
+    }
+
+    if (lastByte !== 10 && lineStart < fileSize) {
+        finishLine(fileSize);
+    }
+
+    return {
+        lineCounter,
+        firstLineRange,
+        tailAllRanges,
+        tailMessageRanges,
+    };
+}
+
+function countChatMessages(chat) {
+    if (!Array.isArray(chat) || chat.length === 0) {
+        return 0;
+    }
+
+    return chat[0]?.chat_metadata ? Math.max(0, chat.length - 1) : chat.length;
+}
+
+function buildFastChatResponse({ kind, chat, source, chatKey, stats, totalMessages, returnedMessages, messageStartIndex, elapsedMs }) {
+    const fileSize = Number(stats?.size || 0);
+    const mtimeMs = Number(stats?.mtimeMs || 0);
+    const startIndex = Math.max(0, Number(messageStartIndex || 0));
+    const returned = Math.max(0, Number(returnedMessages || 0));
+
+    return {
+        ok: true,
+        kind,
+        chat,
+        meta: {
+            partial: kind === 'partial',
+            chatKey,
+            source,
+            fileSize,
+            mtimeMs,
+            version: `${fileSize}:${mtimeMs}`,
+            totalMessages: Math.max(0, Number(totalMessages || 0)),
+            returnedMessages: returned,
+            messageStartIndex: startIndex,
+            messageEndIndexExclusive: startIndex + returned,
+            elapsedMs,
+        },
+    };
 }
 
 function getSettingsPath(req) {
@@ -1557,6 +1878,7 @@ async function getSettingsFastConfig(req, manager) {
         settingsAccelerationEnabled: value.settingsAccelerationEnabled !== false,
         characterListAccelerationEnabled: value.characterListAccelerationEnabled !== false,
         recentChatListAccelerationEnabled: value.recentChatListAccelerationEnabled !== false,
+        progressiveChatLoadingEnabled: value.progressiveChatLoadingEnabled !== false,
         tokenizerBulkCountEnabled: value.tokenizerBulkCountEnabled !== false,
     };
 }
@@ -1574,6 +1896,9 @@ async function setSettingsFastConfig(req, manager) {
         recentChatListAccelerationEnabled: req.body?.recentChatListAccelerationEnabled === undefined
             ? current.recentChatListAccelerationEnabled !== false
             : req.body.recentChatListAccelerationEnabled !== false,
+        progressiveChatLoadingEnabled: req.body?.progressiveChatLoadingEnabled === undefined
+            ? current.progressiveChatLoadingEnabled !== false
+            : req.body.progressiveChatLoadingEnabled !== false,
         tokenizerBulkCountEnabled: req.body?.tokenizerBulkCountEnabled === undefined
             ? current.tokenizerBulkCountEnabled !== false
             : req.body.tokenizerBulkCountEnabled !== false,
@@ -1600,6 +1925,7 @@ async function getSettingsFastConfigSafe(req, manager) {
             settingsAccelerationEnabled: DEFAULT_SETTINGS_ACCELERATION_ENABLED,
             characterListAccelerationEnabled: DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED,
             recentChatListAccelerationEnabled: DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED,
+            progressiveChatLoadingEnabled: DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED,
             tokenizerBulkCountEnabled: DEFAULT_TOKENIZER_BULK_COUNT_ENABLED,
         };
     }
@@ -2226,6 +2552,24 @@ export function registerStEndpoints(router, manager) {
         } catch (error) {
             console.error('[baibaoku] Error in fast-recent endpoint:', error);
             res.status(error.status || 500).json({ error: true, message: error.message });
+        }
+    });
+
+    router.post('/v1/chats/fast-get', async (req, res) => {
+        try {
+            const result = await getFastChatGet(req);
+
+            res.set('X-Baibaoku-Elapsed-Ms', String(result.meta.elapsedMs || 0));
+            res.set('X-Baibaoku-Chat-Kind', String(result.kind));
+            res.set('X-Baibaoku-Chat-Partial', String(result.meta.partial === true));
+            res.set('X-Baibaoku-Chat-Total-Messages', String(result.meta.totalMessages || 0));
+            res.json({
+                ok: true,
+                data: result,
+            });
+        } catch (error) {
+            console.error('[baibaoku] Error in fast-get endpoint:', error);
+            res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
         }
     });
 
