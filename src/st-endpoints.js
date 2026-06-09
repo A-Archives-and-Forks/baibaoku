@@ -16,6 +16,8 @@ const SETTINGS_FAST_CONFIG_STORE = 'fast-config';
 const SETTINGS_FAST_CONFIG_KEY = 'global';
 const DEFAULT_SETTINGS_ACCELERATION_ENABLED = true;
 const DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED = true;
+const DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED = true;
+const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
 const SETTINGS_TEXT_PERSIST_VERSION = 1;
 const SETTINGS_TEXT_PERSIST_FILE = 'settings-text-v1.json';
 const SETTINGS_PAYLOAD_PERSIST_VERSION = 1;
@@ -39,7 +41,7 @@ const settingsSaveLocks = new Map();
 // Cache structure: Map<userHandle, { key: string, text: string }>
 const settingsResponseCaches = new Map();
 let staticSettingsPayload = null;
-const EARLY_BRIDGE_VERSION = '0.4';
+const EARLY_BRIDGE_VERSION = '0.5';
 
 /**
  * Normalizes tags from V1/V2 char data structure.
@@ -262,6 +264,283 @@ function normalizePersistentCacheItem(value) {
         size: Number.isFinite(value.size) ? value.size : undefined,
         data: value.data,
     };
+}
+
+async function getFastRecentChats(req) {
+    const userHandle = req.user?.profile?.handle;
+    if (!userHandle) {
+        const error = new Error('Unauthorized');
+        error.status = 401;
+        throw error;
+    }
+
+    const startedAt = Date.now();
+    const pinnedChats = Array.isArray(req.body?.pinned) ? req.body.pinned : [];
+    const max = normalizeRecentMax(req.body?.max) + pinnedChats.length;
+    const withMetadata = Boolean(req.body?.metadata);
+    const allChatFiles = [];
+    const metrics = {
+        characterFiles: 0,
+        groupFiles: 0,
+        rootFiles: 0,
+        invalidFiles: 0,
+        selectedFiles: 0,
+        totalMs: 0,
+    };
+
+    await Promise.allSettled([
+        collectFastRecentCharacterChatFiles(req, allChatFiles, metrics),
+        collectFastRecentGroupChatFiles(req, allChatFiles, metrics),
+        collectFastRecentRootChatFiles(req, allChatFiles, metrics),
+    ]);
+
+    const recentChats = allChatFiles.sort((a, b) => {
+        const isAPinned = isPinnedRecentChat(a, pinnedChats);
+        const isBPinned = isPinnedRecentChat(b, pinnedChats);
+
+        if (isAPinned && !isBPinned) return -1;
+        if (!isAPinned && isBPinned) return 1;
+
+        return b.mtime - a.mtime;
+    }).slice(0, max);
+    metrics.selectedFiles = recentChats.length;
+
+    const chatData = await Promise.allSettled(recentChats.map(file => getFastRecentChatInfo(file, withMetadata)));
+    const validFiles = [];
+    for (const result of chatData) {
+        if (result.status === 'fulfilled' && result.value?.file_name) {
+            validFiles.push(result.value);
+        } else if (result.status === 'rejected') {
+            metrics.invalidFiles += 1;
+        }
+    }
+
+    metrics.totalMs = Date.now() - startedAt;
+    return { data: validFiles, metrics };
+}
+
+function normalizeRecentMax(value) {
+    const max = parseInt(value ?? Number.MAX_SAFE_INTEGER);
+    return Number.isFinite(max) && max > 0 ? max : Number.MAX_SAFE_INTEGER;
+}
+
+async function collectFastRecentCharacterChatFiles(req, allChatFiles, metrics) {
+    const directories = req.user?.directories || {};
+    const charactersDir = directories.characters;
+    const chatsDir = directories.chats;
+
+    if (!charactersDir || !chatsDir) {
+        return;
+    }
+
+    const characterDirents = await fs.promises.readdir(charactersDir, { withFileTypes: true });
+    const avatarSet = new Set(characterDirents
+        .filter(dirent => dirent.isFile() && path.extname(dirent.name) === '.png')
+        .map(dirent => dirent.name));
+    const chatDirents = await fs.promises.readdir(chatsDir, { withFileTypes: true });
+
+    for (const dirent of chatDirents) {
+        if (!dirent.isDirectory()) {
+            continue;
+        }
+
+        const pngFile = `${dirent.name}.png`;
+        if (!avatarSet.has(pngFile)) {
+            continue;
+        }
+
+        const pathToChats = path.join(chatsDir, dirent.name);
+        const chatFiles = await fs.promises.readdir(pathToChats, { withFileTypes: true });
+        const jsonlFiles = chatFiles.filter(file => file.isFile() && path.extname(file.name) === '.jsonl');
+
+        for (const file of jsonlFiles) {
+            const filePath = path.join(pathToChats, file.name);
+            const stats = await fs.promises.stat(filePath);
+            allChatFiles.push({ pngFile, filePath, mtime: stats.mtimeMs });
+            metrics.characterFiles += 1;
+        }
+    }
+}
+
+async function collectFastRecentGroupChatFiles(req, allChatFiles, metrics) {
+    const directories = req.user?.directories || {};
+    const groupsDir = directories.groups;
+    const groupChatsDir = directories.groupChats;
+
+    if (!groupsDir || !groupChatsDir) {
+        return;
+    }
+
+    const groupDirents = await fs.promises.readdir(groupsDir, { withFileTypes: true });
+    const groups = groupDirents.filter(dirent => dirent.isFile() && path.extname(dirent.name) === '.json');
+
+    for (const group of groups) {
+        try {
+            const groupPath = path.join(groupsDir, group.name);
+            const groupData = JSON.parse(await fs.promises.readFile(groupPath, 'utf8'));
+
+            if (!Array.isArray(groupData.chats)) {
+                continue;
+            }
+
+            for (const chat of groupData.chats) {
+                const filePath = path.join(groupChatsDir, `${chat}.jsonl`);
+                if (!fs.existsSync(filePath)) {
+                    continue;
+                }
+
+                const stats = await fs.promises.stat(filePath);
+                allChatFiles.push({ groupId: groupData.id, filePath, mtime: stats.mtimeMs });
+                metrics.groupFiles += 1;
+            }
+        } catch {
+            continue;
+        }
+    }
+}
+
+async function collectFastRecentRootChatFiles(req, allChatFiles, metrics) {
+    const chatsDir = req.user?.directories?.chats;
+    if (!chatsDir) {
+        return;
+    }
+
+    const dirents = await fs.promises.readdir(chatsDir, { withFileTypes: true });
+    const chatFiles = dirents.filter(dirent => dirent.isFile() && path.extname(dirent.name) === '.jsonl');
+
+    for (const file of chatFiles) {
+        const filePath = path.join(chatsDir, file.name);
+        const stats = await fs.promises.stat(filePath);
+        allChatFiles.push({ filePath, mtime: stats.mtimeMs });
+        metrics.rootFiles += 1;
+    }
+}
+
+function isPinnedRecentChat(chatFile, pinnedChats) {
+    return pinnedChats.some(pinned => {
+        return pinned?.file_name === path.basename(chatFile.filePath)
+            && (pinned.avatar === chatFile.pngFile || pinned.group === chatFile.groupId);
+    });
+}
+
+async function getFastRecentChatInfo(chatFile, withMetadata = false) {
+    const parsedPath = path.parse(chatFile.filePath);
+    const stats = await fs.promises.stat(chatFile.filePath);
+    const chatData = {
+        file_id: parsedPath.name,
+        file_name: parsedPath.base,
+        file_size: bytes.format(stats.size) ?? '',
+        chat_items: 0,
+        mes: '[The chat is empty]',
+        last_mes: stats.mtimeMs,
+    };
+
+    if (chatFile.groupId) {
+        chatData.group = chatFile.groupId;
+    } else if (chatFile.pngFile) {
+        chatData.avatar = chatFile.pngFile;
+    }
+
+    if (stats.size === 0) {
+        return chatData;
+    }
+
+    const fileHandle = await fs.promises.open(chatFile.filePath, 'r');
+
+    try {
+        const scan = await scanJsonlLineInfo(fileHandle, stats.size);
+        chatData.chat_items = Math.max(0, scan.lineCounter - 1);
+
+        if (withMetadata && scan.firstLineLength > 0) {
+            const firstLine = await readFileRangeAsUtf8(fileHandle, scan.firstLineStart, scan.firstLineLength);
+            const firstJson = parseJsonLine(firstLine);
+            if (firstJson?.chat_metadata && typeof firstJson.chat_metadata === 'object') {
+                chatData.chat_metadata = firstJson.chat_metadata;
+            }
+        }
+
+        if (scan.lastLineLength <= 0) {
+            return chatData;
+        }
+
+        const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
+        const jsonData = parseJsonLine(lastLine);
+        if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
+            chatData.mes = jsonData.mes || '[The message is empty]';
+            chatData.last_mes = jsonData.send_date || new Date(Math.round(stats.mtimeMs)).toISOString();
+            return chatData;
+        }
+
+        console.warn('Found an invalid or corrupted chat file:', chatFile.filePath);
+        return null;
+    } finally {
+        await fileHandle.close();
+    }
+}
+
+async function scanJsonlLineInfo(fileHandle, fileSize) {
+    const buffer = Buffer.allocUnsafe(FAST_RECENT_CHAT_READ_BUFFER_SIZE);
+    let lineCounter = 0;
+    let position = 0;
+    let previousLineStart = 0;
+    let lastLineStart = 0;
+    let firstLineEnd = -1;
+    let lastByte = null;
+
+    while (position < fileSize) {
+        const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) {
+            break;
+        }
+
+        const chunk = buffer.subarray(0, bytesRead);
+        let searchOffset = 0;
+        let newlineOffset;
+
+        while ((newlineOffset = chunk.indexOf(10, searchOffset)) !== -1) {
+            const absoluteOffset = position + newlineOffset;
+            if (firstLineEnd === -1) {
+                firstLineEnd = absoluteOffset;
+            }
+            lineCounter += 1;
+            previousLineStart = lastLineStart;
+            lastLineStart = absoluteOffset + 1;
+            searchOffset = newlineOffset + 1;
+        }
+
+        lastByte = chunk[bytesRead - 1];
+        position += bytesRead;
+    }
+
+    if (lastByte !== 10) {
+        lineCounter += 1;
+    }
+
+    const firstLineLength = firstLineEnd === -1 ? fileSize : firstLineEnd;
+    const lastLineStartOffset = lastByte === 10 ? previousLineStart : lastLineStart;
+    const lastLineEndOffset = lastByte === 10 ? Math.max(0, position - 1) : position;
+
+    return {
+        lineCounter,
+        firstLineStart: 0,
+        firstLineLength,
+        lastLineStart: lastLineStartOffset,
+        lastLineLength: Math.max(0, lastLineEndOffset - lastLineStartOffset),
+    };
+}
+
+async function readFileRangeAsUtf8(fileHandle, start, length) {
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await fileHandle.read(buffer, 0, length, start);
+    return buffer.subarray(0, bytesRead).toString('utf8');
+}
+
+function parseJsonLine(line) {
+    try {
+        return JSON.parse(String(line ?? '').replace(/\r$/, ''));
+    } catch {
+        return null;
+    }
 }
 
 function getSettingsPath(req) {
@@ -1269,6 +1548,7 @@ async function getSettingsFastConfig(req, manager) {
     return {
         settingsAccelerationEnabled: value.settingsAccelerationEnabled !== false,
         characterListAccelerationEnabled: value.characterListAccelerationEnabled !== false,
+        recentChatListAccelerationEnabled: value.recentChatListAccelerationEnabled !== false,
     };
 }
 
@@ -1282,6 +1562,9 @@ async function setSettingsFastConfig(req, manager) {
         characterListAccelerationEnabled: req.body?.characterListAccelerationEnabled === undefined
             ? current.characterListAccelerationEnabled !== false
             : req.body.characterListAccelerationEnabled !== false,
+        recentChatListAccelerationEnabled: req.body?.recentChatListAccelerationEnabled === undefined
+            ? current.recentChatListAccelerationEnabled !== false
+            : req.body.recentChatListAccelerationEnabled !== false,
     };
 
     await manager.set(
@@ -1304,6 +1587,7 @@ async function getSettingsFastConfigSafe(req, manager) {
         return {
             settingsAccelerationEnabled: DEFAULT_SETTINGS_ACCELERATION_ENABLED,
             characterListAccelerationEnabled: DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED,
+            recentChatListAccelerationEnabled: DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED,
         };
     }
 }
@@ -1313,8 +1597,10 @@ function makeEarlyBridgeScript(options = {}) {
     const fastSettingsGetPath = `${apiPrefix}/v1/settings/fast-get`;
     const fastSettingsSavePath = `${apiPrefix}/v1/settings/fast-save`;
     const fastCharacterListPath = `${apiPrefix}/v1/characters/fast-all`;
+    const fastRecentChatListPath = `${apiPrefix}/v1/chats/fast-recent`;
     const settingsAccelerationEnabled = options.settingsAccelerationEnabled !== false;
     const characterListAccelerationEnabled = options.characterListAccelerationEnabled !== false;
+    const recentChatListAccelerationEnabled = options.recentChatListAccelerationEnabled !== false;
 
     return `/* baibaoku early bridge v${EARLY_BRIDGE_VERSION} */
 (function () {
@@ -1325,8 +1611,10 @@ function makeEarlyBridgeScript(options = {}) {
   var FAST_SETTINGS_GET = ${JSON.stringify(fastSettingsGetPath)};
   var FAST_SETTINGS_SAVE = ${JSON.stringify(fastSettingsSavePath)};
   var FAST_CHARACTER_LIST = ${JSON.stringify(fastCharacterListPath)};
+  var FAST_RECENT_CHAT_LIST = ${JSON.stringify(fastRecentChatListPath)};
   var SETTINGS_ACCELERATION_ENABLED = ${JSON.stringify(settingsAccelerationEnabled)};
   var CHARACTER_LIST_ACCELERATION_ENABLED = ${JSON.stringify(characterListAccelerationEnabled)};
+  var RECENT_CHAT_LIST_ACCELERATION_ENABLED = ${JSON.stringify(recentChatListAccelerationEnabled)};
 
   if (window[FLAG] && window[FLAG].installed) {
     return;
@@ -1347,8 +1635,10 @@ function makeEarlyBridgeScript(options = {}) {
   state.fastGetPath = FAST_SETTINGS_GET;
   state.fastSavePath = FAST_SETTINGS_SAVE;
   state.fastCharacterListPath = FAST_CHARACTER_LIST;
-  state.requests = state.requests || { get: 0, save: 0, characters: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
+  state.fastRecentChatListPath = FAST_RECENT_CHAT_LIST;
+  state.requests = state.requests || { get: 0, save: 0, characters: 0, recentChats: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
   if (typeof state.requests.saveFrontendCache !== 'number') state.requests.saveFrontendCache = 0;
+  if (typeof state.requests.recentChats !== 'number') state.requests.recentChats = 0;
   state.rawFetch = rawFetch;
   state.settingsGetCache = state.settingsGetCache || null;
   state.settingsGetPending = null;
@@ -1381,6 +1671,17 @@ function makeEarlyBridgeScript(options = {}) {
   state.setCharacterListAccelerationEnabled = writeCharacterListAccelerationEnabled;
   state.characterListAccelerationEnabled = CHARACTER_LIST_ACCELERATION_ENABLED;
 
+  function writeRecentChatListAccelerationEnabled(enabled) {
+    state.recentChatListAccelerationEnabled = Boolean(enabled);
+    return state.recentChatListAccelerationEnabled;
+  }
+
+  state.isRecentChatListAccelerationEnabled = function () {
+    return state.recentChatListAccelerationEnabled !== false;
+  };
+  state.setRecentChatListAccelerationEnabled = writeRecentChatListAccelerationEnabled;
+  state.recentChatListAccelerationEnabled = RECENT_CHAT_LIST_ACCELERATION_ENABLED;
+
   function toUrl(input) {
     try {
       if (typeof input === 'string') return new URL(input, location.href);
@@ -1399,6 +1700,7 @@ function makeEarlyBridgeScript(options = {}) {
     if (url.pathname === '/api/settings/get') return { kind: 'get', fastPath: FAST_SETTINGS_GET };
     if (url.pathname === '/api/settings/save') return { kind: 'save', fastPath: FAST_SETTINGS_SAVE };
     if (url.pathname === '/api/characters/all') return { kind: 'characters', fastPath: FAST_CHARACTER_LIST };
+    if (url.pathname === '/api/chats/recent') return { kind: 'recentChats', fastPath: FAST_RECENT_CHAT_LIST };
     return null;
   }
 
@@ -1606,6 +1908,9 @@ function makeEarlyBridgeScript(options = {}) {
       if (state.characterListAccelerationEnabled === false) return false;
       return isPlainEmptyObject(await readJsonBody(input, init));
     }
+    if (route.kind === 'recentChats') {
+      return state.recentChatListAccelerationEnabled !== false;
+    }
     return state.settingsAccelerationEnabled !== false;
   }
 
@@ -1740,6 +2045,11 @@ function makeEarlyBridgeScript(options = {}) {
           if (!Array.isArray(characterData)) {
             throw new Error('Fast character list returned a non-array payload');
           }
+        } else if (route.kind === 'recentChats') {
+          var recentChatData = await response.clone().json().catch(function () { return null; });
+          if (!Array.isArray(recentChatData)) {
+            throw new Error('Fast recent chat list returned a non-array payload');
+          }
         }
         return response;
       }
@@ -1807,6 +2117,22 @@ export function registerStEndpoints(router, manager) {
         } catch (error) {
             console.error('[baibaoku] Error in fast-all endpoint:', error);
             res.status(500).json({ error: true, message: error.message });
+        }
+    });
+
+    router.post('/v1/chats/fast-recent', async (req, res) => {
+        try {
+            const { data, metrics } = await getFastRecentChats(req);
+
+            res.set('X-Baibaoku-Elapsed-Ms', String(metrics.totalMs));
+            res.set('X-Baibaoku-Recent-Selected-Files', String(metrics.selectedFiles));
+            res.set('X-Baibaoku-Recent-Character-Files', String(metrics.characterFiles));
+            res.set('X-Baibaoku-Recent-Group-Files', String(metrics.groupFiles));
+            res.set('X-Baibaoku-Recent-Root-Files', String(metrics.rootFiles));
+            res.json(data);
+        } catch (error) {
+            console.error('[baibaoku] Error in fast-recent endpoint:', error);
+            res.status(error.status || 500).json({ error: true, message: error.message });
         }
     });
 
