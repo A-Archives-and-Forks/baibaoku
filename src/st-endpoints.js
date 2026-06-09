@@ -25,7 +25,7 @@ const SETTINGS_FAST_CONFIG_KEY = 'global';
 const DEFAULT_SETTINGS_ACCELERATION_ENABLED = true;
 const DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED = true;
-const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = true;
+const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = false;
 const DEFAULT_TOKENIZER_BULK_COUNT_ENABLED = true;
 const SETTINGS_AUTOSAVE_INTERVAL = 10 * 60 * 1000;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
@@ -1987,7 +1987,7 @@ async function getSettingsFastConfig(req, manager) {
         settingsAccelerationEnabled: value.settingsAccelerationEnabled !== false,
         characterListAccelerationEnabled: value.characterListAccelerationEnabled !== false,
         recentChatListAccelerationEnabled: value.recentChatListAccelerationEnabled !== false,
-        progressiveChatLoadingEnabled: value.progressiveChatLoadingEnabled !== false,
+        progressiveChatLoadingEnabled: value.progressiveChatLoadingEnabled === true,
         tokenizerBulkCountEnabled: value.tokenizerBulkCountEnabled !== false,
     };
 }
@@ -2006,8 +2006,8 @@ async function setSettingsFastConfig(req, manager) {
             ? current.recentChatListAccelerationEnabled !== false
             : req.body.recentChatListAccelerationEnabled !== false,
         progressiveChatLoadingEnabled: req.body?.progressiveChatLoadingEnabled === undefined
-            ? current.progressiveChatLoadingEnabled !== false
-            : req.body.progressiveChatLoadingEnabled !== false,
+            ? current.progressiveChatLoadingEnabled === true
+            : req.body.progressiveChatLoadingEnabled === true,
         tokenizerBulkCountEnabled: req.body?.tokenizerBulkCountEnabled === undefined
             ? current.tokenizerBulkCountEnabled !== false
             : req.body.tokenizerBulkCountEnabled !== false,
