@@ -1664,6 +1664,44 @@ function makeEarlyBridgeScript(options = {}) {
     return JSON.stringify(parsed.value == null ? {} : parsed.value, null, 4);
   }
 
+  async function gzipFastSaveInit(init) {
+    var headers = new Headers(init.headers || undefined);
+    if (headers.has('content-encoding')) return init;
+    if (typeof CompressionStream !== 'function') return init;
+
+    var text = await bodyToText(init.body);
+    if (text === null || !text) return init;
+
+    try {
+      var encoded = new TextEncoder().encode(text);
+      var compressed = await new Response(
+        new Blob([encoded]).stream().pipeThrough(new CompressionStream('gzip'))
+      ).arrayBuffer();
+
+      if (!compressed || compressed.byteLength >= encoded.byteLength) {
+        return init;
+      }
+
+      headers.set('content-encoding', 'gzip');
+      headers.delete('content-length');
+      state.lastFastSaveCompression = {
+        encoding: 'gzip',
+        originalBytes: encoded.byteLength,
+        compressedBytes: compressed.byteLength,
+        compressedAt: Date.now(),
+      };
+
+      return {
+        ...init,
+        headers: headers,
+        body: compressed,
+      };
+    } catch (error) {
+      state.lastFastSaveCompressionError = error && error.message ? error.message : String(error);
+      return init;
+    }
+  }
+
   function isPlainEmptyObject(value) {
     return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0;
   }
@@ -1776,6 +1814,7 @@ function makeEarlyBridgeScript(options = {}) {
           return makeCachedSettingsSaveResponse(state.settingsSaveCache, 'hit');
         }
 
+        fastInit = await gzipFastSaveInit(fastInit);
         var saveResponsePromise = rawFetch(route.fastPath, fastInit);
         if (saveKey) {
           var saveCachePromise = saveResponsePromise
