@@ -14,7 +14,7 @@ const WAL_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
 const WAL_TRUNCATE_AFTER_BYTES = 32 * 1024 * 1024;
 const WAL_TRUNCATE_MIN_INTERVAL_MS = 60 * 1000;
 
-let SqliteDatabase = null;
+let sqliteDriver = null;
 let sqliteImportError = null;
 
 export class DatabaseManager {
@@ -25,13 +25,14 @@ export class DatabaseManager {
 
     async getDriverStatus() {
         try {
-            await loadSqliteDriver();
-            return { available: true, package: 'better-sqlite3' };
+            const driver = await loadSqliteDriver();
+            return { available: true, package: driver.package };
         } catch (error) {
             return {
                 available: false,
-                package: 'better-sqlite3',
+                package: 'node:sqlite/better-sqlite3',
                 message: error.message,
+                details: error.details,
             };
         }
     }
@@ -333,7 +334,7 @@ export class DatabaseManager {
     }
 
     async #openDatabase(databasePath) {
-        await loadSqliteDriver();
+        const driver = await loadSqliteDriver();
         fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 
         const connectionKey = path.resolve(databasePath);
@@ -341,7 +342,7 @@ export class DatabaseManager {
             return this.connections.get(connectionKey);
         }
 
-        const db = new SqliteDatabase(databasePath);
+        const db = driver.open(databasePath);
         db.pragma('journal_mode = WAL');
         db.pragma(`wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
         db.pragma(`journal_size_limit = ${WAL_JOURNAL_SIZE_LIMIT_BYTES}`);
@@ -445,27 +446,146 @@ export class DatabaseManager {
 }
 
 async function loadSqliteDriver() {
-    if (SqliteDatabase) {
-        return SqliteDatabase;
+    if (sqliteDriver) {
+        return sqliteDriver;
     }
 
     if (sqliteImportError) {
         throw sqliteImportError;
     }
 
+    const causes = [];
+
+    try {
+        const module = await import('node:sqlite');
+        if (module.DatabaseSync) {
+            sqliteDriver = {
+                package: 'node:sqlite',
+                open(databasePath) {
+                    return new NodeSqliteDatabase(new module.DatabaseSync(databasePath));
+                },
+            };
+            return sqliteDriver;
+        }
+
+        causes.push('node:sqlite did not export DatabaseSync.');
+    } catch (error) {
+        causes.push(`node:sqlite: ${error.message}`);
+    }
+
     try {
         const module = await import('better-sqlite3');
-        SqliteDatabase = module.default ?? module;
-        return SqliteDatabase;
+        const BetterSqliteDatabase = module.default ?? module;
+        sqliteDriver = {
+            package: 'better-sqlite3',
+            open(databasePath) {
+                return new BetterSqliteDatabase(databasePath);
+            },
+        };
+        return sqliteDriver;
     } catch (error) {
+        causes.push(`better-sqlite3: ${error.message}`);
         sqliteImportError = new BaiBaoKuError(
-            'SQLITE_DRIVER_NOT_INSTALLED',
-            'better-sqlite3 is not installed. Run npm install inside plugins/baibaoku.',
+            'SQLITE_DRIVER_NOT_AVAILABLE',
+            'No SQLite driver is available. Use a Node.js version with node:sqlite, or install optional better-sqlite3 inside plugins/baibaoku.',
             503,
-            { cause: error.message },
+            { causes },
         );
         throw sqliteImportError;
     }
+}
+
+class NodeSqliteDatabase {
+    constructor(db) {
+        this.db = db;
+    }
+
+    prepare(sql) {
+        return new NodeSqliteStatement(this.db.prepare(sql));
+    }
+
+    exec(sql) {
+        return this.db.exec(sql);
+    }
+
+    close() {
+        return this.db.close();
+    }
+
+    pragma(sql, options = {}) {
+        const rows = this.db.prepare(`PRAGMA ${sql}`).all().map(normalizeNodeSqliteRow);
+        if (options.simple) {
+            const row = rows[0];
+            if (!row) return undefined;
+            return Object.values(row)[0];
+        }
+
+        return rows;
+    }
+
+    transaction(callback) {
+        return (...args) => {
+            let shouldRollback = false;
+
+            try {
+                this.db.exec('BEGIN IMMEDIATE');
+                shouldRollback = true;
+
+                const result = callback(...args);
+
+                this.db.exec('COMMIT');
+                shouldRollback = false;
+                return result;
+            } catch (error) {
+                if (shouldRollback) {
+                    try {
+                        this.db.exec('ROLLBACK');
+                    } catch (rollbackError) {
+                        console.warn('[BaiBaoKu] SQLite rollback failed:', rollbackError);
+                    }
+                }
+
+                throw error;
+            }
+        };
+    }
+}
+
+class NodeSqliteStatement {
+    constructor(statement) {
+        this.statement = statement;
+    }
+
+    run(...params) {
+        return this.statement.run(...params);
+    }
+
+    get(...params) {
+        return normalizeNodeSqliteRow(this.statement.get(...params));
+    }
+
+    all(...params) {
+        return this.statement.all(...params).map(normalizeNodeSqliteRow);
+    }
+}
+
+function normalizeNodeSqliteRow(row) {
+    if (!row || typeof row !== 'object') return row;
+
+    const normalized = {};
+    for (const [key, value] of Object.entries(row)) {
+        normalized[key] = normalizeNodeSqliteValue(value);
+    }
+
+    return normalized;
+}
+
+function normalizeNodeSqliteValue(value) {
+    if (value instanceof Uint8Array && !Buffer.isBuffer(value)) {
+        return Buffer.from(value);
+    }
+
+    return value;
 }
 
 function buildPrefixClause(store, prefix) {
