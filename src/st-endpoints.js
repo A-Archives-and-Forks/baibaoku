@@ -14,6 +14,10 @@ import {
     getSentencepiceTokenizer,
     getWebTokenizer,
 } from '../../../src/endpoints/tokenizers.js';
+import {
+    closeSaveGenerateJobs,
+    registerSaveGenerateEndpoints,
+} from './save-generate.js';
 
 const FAST_CHARACTER_CACHE_DATABASE = 'baibaoku.internal';
 const FAST_CHARACTER_CACHE_STORE = 'character-fast-all';
@@ -2973,6 +2977,8 @@ function guesstimateBulk(str) {
 }
 
 export function closeStEndpointCaches() {
+    closeSaveGenerateJobs();
+
     for (const userCache of settingsUserCaches.values()) {
         for (const watcher of userCache.payloadWatchers?.values() || []) {
             watcher.close();
@@ -2994,6 +3000,8 @@ export function closeStEndpointCaches() {
 }
 
 export function registerStEndpoints(router, manager) {
+    registerSaveGenerateEndpoints(router);
+
     router.get('/v1/extensions/manifest-bundle', (req, res) => {
         try {
             res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');

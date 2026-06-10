@@ -394,3 +394,70 @@ if (window.BaiBaoKu && await window.BaiBaoKu.isAvailable()) {
   "database": "character-notes"
 }
 ```
+
+## POST /v1/chats/save-generate
+
+Experimental SillyTavern chat-completions wrapper. It keeps the original
+`/api/backends/chat-completions/generate` body under `generate`, and adds a
+separate `save` descriptor so the server can persist the generated assistant
+message after generation finishes.
+
+Supported in v1:
+- single-character chats only
+- normal and regenerate assistant replies only
+- chat-completions only
+- no multi-swipe (`n > 1`)
+- no tool calls
+
+Request:
+```json
+{
+  "save": {
+    "kind": "character",
+    "type": "normal",
+    "chatId": "Character - 2026-06-10",
+    "avatar_url": "character.png",
+    "file_name": "Character - 2026-06-10",
+    "ch_name": "Character",
+    "expectedVersion": "12345:1781000000000.123"
+  },
+  "generate": {
+    "type": "normal",
+    "messages": [],
+    "model": "gpt-4.1",
+    "stream": false,
+    "chat_completion_source": "openai"
+  }
+}
+```
+
+For non-streaming requests, the endpoint waits for generation and the save
+attempt to finish, then returns the original chat-completions response body.
+The job id is exposed in `X-Baibaoku-Save-Generate-Job-Id`, and the terminal
+save status is exposed in `X-Baibaoku-Save-Generate-Status`.
+
+For streaming requests, the endpoint streams the provider SSE back to the
+client and exposes the job id in `X-Baibaoku-Save-Generate-Job-Id`. If the
+stream already produced assistant text, later stream truncation or upstream
+errors are treated as a partial but valid generation and the collected text is
+saved. Explicit API errors with no assistant text are reported as generation
+failures.
+
+Poll status:
+```text
+POST /api/plugins/baibaoku/v1/chats/save-generate/status
+GET  /api/plugins/baibaoku/v1/chats/save-generate/pending?chatId=...
+GET  /api/plugins/baibaoku/v1/chats/save-generate/:jobId
+```
+
+`pending?chatId=...` returns the latest save-generate job for the current user
+and chat id. This lets the frontend recover the job id after a page refresh or
+mobile browser resume while generation is still running.
+
+Terminal statuses:
+```text
+saved
+already_saved
+conflict
+failed
+```
