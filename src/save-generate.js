@@ -55,7 +55,11 @@ export function registerSaveGenerateEndpoints(router) {
         try {
             res.json({
                 ok: true,
-                data: findSaveGenerateJobForChat(req, req.query?.chatId || req.query?.chat_id),
+                data: findSaveGenerateJobForChat(
+                    req,
+                    req.query?.chatId || req.query?.chat_id,
+                    req.query?.lastMessageHash || req.query?.last_message_hash,
+                ),
             });
         } catch (error) {
             res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
@@ -972,7 +976,7 @@ function getSaveGenerateJobForRequest(req, jobId) {
     return serializeSaveGenerateJob(job);
 }
 
-function findSaveGenerateJobForChat(req, chatId) {
+function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '') {
     cleanupSaveGenerateJobs();
 
     const userHandle = req.user?.profile?.handle;
@@ -1010,7 +1014,20 @@ function findSaveGenerateJobForChat(req, chatId) {
         }
     }
 
-    return latestPending ? serializeSaveGenerateJob(latestPending) : latestTerminal ? serializeSaveGenerateJob(latestTerminal) : null;
+    if (latestPending) {
+        return serializeSaveGenerateJob(latestPending);
+    }
+
+    if (!latestTerminal) {
+        return null;
+    }
+
+    if (isSaveGenerateSavedStatus(latestTerminal.status)
+        && isSaveGenerateLastMessageHashMatch(latestTerminal, lastMessageHash)) {
+        return null;
+    }
+
+    return serializeSaveGenerateJob(latestTerminal);
 }
 
 function serializeSaveGenerateJob(job) {
@@ -1099,6 +1116,30 @@ function getSaveGenerateType(save, generate) {
 
 function isSaveGenerateTerminalStatus(status) {
     return ['saved', 'already_saved', 'conflict', 'failed'].includes(status);
+}
+
+function isSaveGenerateSavedStatus(status) {
+    return ['saved', 'already_saved'].includes(status);
+}
+
+function isSaveGenerateLastMessageHashMatch(job, lastMessageHash) {
+    const expectedHash = String(lastMessageHash || '').trim();
+    if (!expectedHash) {
+        return false;
+    }
+
+    const savedText = job?.savedMessage?.mes ?? job?.resultText ?? '';
+    return makeSaveGenerateMessageContentHash(savedText) === expectedHash;
+}
+
+function makeSaveGenerateMessageContentHash(value) {
+    const text = String(value ?? '');
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return `${text.length.toString(36)}:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
 function throwHttpError(message, status) {

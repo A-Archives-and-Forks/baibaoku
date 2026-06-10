@@ -446,13 +446,15 @@ failures.
 Poll status:
 ```text
 POST /api/plugins/baibaoku/v1/chats/save-generate/status
-GET  /api/plugins/baibaoku/v1/chats/save-generate/pending?chatId=...
+GET  /api/plugins/baibaoku/v1/chats/save-generate/pending?chatId=...&lastMessageHash=...
 GET  /api/plugins/baibaoku/v1/chats/save-generate/:jobId
 ```
 
 `pending?chatId=...` returns the latest save-generate job for the current user
 and chat id. This lets the frontend recover the job id after a page refresh or
 mobile browser resume while generation is still running.
+If `lastMessageHash` is provided and it matches the saved job message content,
+the endpoint returns `data: null` because the frontend already has the result.
 
 Terminal statuses:
 ```text
