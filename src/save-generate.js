@@ -4,16 +4,33 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { Writable } from 'node:stream';
 
+import _ from 'lodash';
+import sanitize from 'sanitize-filename';
+import { sync as writeFileAtomicSync } from 'write-file-atomic';
+
 import { router as chatCompletionsRouter } from '../../../src/endpoints/backends/chat-completions.js';
-import { trySaveChat } from '../../../src/endpoints/chats.js';
+import * as chatsEndpoint from '../../../src/endpoints/chats.js';
 import { CHAT_COMPLETION_SOURCES } from '../../../src/constants.js';
+import {
+    generateTimestamp,
+    getConfigValue,
+    removeOldBackups,
+    tryParse,
+} from '../../../src/util.js';
 
 const SAVE_GENERATE_JOB_TTL_MS = 30 * 60 * 1000;
 const SAVE_GENERATE_MAX_JOBS = 200;
 const SAVE_GENERATE_DEFAULT_ERROR_STATUS = 500;
+const SAVE_GENERATE_CHAT_BACKUPS_PREFIX = 'chat_';
+
+const saveGenerateChatBackupsEnabled = !!getConfigValue('backups.chat.enabled', true, 'boolean');
+const saveGenerateChatBackupLimit = Number(getConfigValue('backups.chat.maxTotalBackups', -1, 'number'));
+const saveGenerateChatBackupThrottleInterval = Number(getConfigValue('backups.chat.throttleInterval', 10_000, 'number'));
+const saveGenerateChatIntegrityCheck = !!getConfigValue('backups.chat.checkIntegrity', true, 'boolean');
 
 const saveGenerateJobs = new Map();
 const saveGenerateLocks = new Map();
+const saveGenerateBackupFunctions = new Map();
 
 export function registerSaveGenerateEndpoints(router) {
     router.post('/v1/chats/save-generate', async (req, res) => {
@@ -809,7 +826,7 @@ async function saveGeneratedMessageLocked(job) {
         return;
     }
 
-    await trySaveChat(
+    await saveChatCompat(
         nextChat,
         job.descriptor.filePath,
         false,
@@ -825,6 +842,101 @@ async function saveGeneratedMessageLocked(job) {
         savedAt: Date.now(),
         finishedAt: Date.now(),
     });
+}
+
+async function saveChatCompat(chatData, filePath, skipIntegrityCheck = false, handle, cardName, backupDirectory) {
+    if (typeof chatsEndpoint.trySaveChat === 'function') {
+        return chatsEndpoint.trySaveChat(chatData, filePath, skipIntegrityCheck, handle, cardName, backupDirectory);
+    }
+
+    const jsonlData = chatData?.map(message => JSON.stringify(message)).join('\n');
+    const doIntegrityCheck = saveGenerateChatIntegrityCheck && !skipIntegrityCheck;
+    const chatIntegritySlug = doIntegrityCheck ? chatData?.[0]?.chat_metadata?.integrity : undefined;
+
+    if (chatIntegritySlug && !await checkChatIntegrityCompat(filePath, chatIntegritySlug)) {
+        const error = new Error(`Chat integrity check failed for "${filePath}". The expected integrity slug was "${chatIntegritySlug}".`);
+        error.code = 'BAIBAOKU_CHAT_INTEGRITY';
+        throw error;
+    }
+
+    writeFileAtomicSync(filePath, jsonlData, 'utf8');
+    getSaveGenerateBackupFunction(handle)(backupDirectory, cardName, jsonlData);
+}
+
+async function checkChatIntegrityCompat(filePath, integritySlug) {
+    if (!fs.existsSync(filePath)) {
+        return true;
+    }
+
+    const firstLine = await readFirstLineCompat(filePath);
+    const jsonData = tryParse(firstLine);
+    const chatIntegrity = jsonData?.chat_metadata?.integrity;
+
+    if (!chatIntegrity) {
+        return true;
+    }
+
+    return chatIntegrity === integritySlug;
+}
+
+async function readFirstLineCompat(filePath) {
+    const handle = await fs.promises.open(filePath, 'r');
+    try {
+        const buffer = Buffer.alloc(4096);
+        let line = '';
+        let position = 0;
+
+        while (true) {
+            const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+            if (!bytesRead) {
+                return line;
+            }
+
+            const chunk = buffer.subarray(0, bytesRead).toString('utf8');
+            const newlineIndex = chunk.indexOf('\n');
+            if (newlineIndex !== -1) {
+                return line + chunk.slice(0, newlineIndex);
+            }
+
+            line += chunk;
+            position += bytesRead;
+        }
+    } finally {
+        await handle.close();
+    }
+}
+
+function getSaveGenerateBackupFunction(handle) {
+    const key = handle || 'default';
+    if (!saveGenerateBackupFunctions.has(key)) {
+        saveGenerateBackupFunctions.set(key, _.throttle(backupChatCompat, saveGenerateChatBackupThrottleInterval, {
+            leading: true,
+            trailing: true,
+        }));
+    }
+
+    return saveGenerateBackupFunctions.get(key) || (() => { });
+}
+
+function backupChatCompat(directory, name, chat) {
+    try {
+        if (!saveGenerateChatBackupsEnabled || !directory || !fs.existsSync(directory)) {
+            return;
+        }
+
+        const safeName = sanitize(String(name || 'chat')).replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        const backupFile = path.join(directory, `${SAVE_GENERATE_CHAT_BACKUPS_PREFIX}${safeName}_${generateTimestamp()}.jsonl`);
+        writeFileAtomicSync(backupFile, chat, 'utf8');
+        removeOldBackups(directory, `${SAVE_GENERATE_CHAT_BACKUPS_PREFIX}${safeName}_`);
+
+        if (isNaN(saveGenerateChatBackupLimit) || saveGenerateChatBackupLimit < 0) {
+            return;
+        }
+
+        removeOldBackups(directory, SAVE_GENERATE_CHAT_BACKUPS_PREFIX, saveGenerateChatBackupLimit);
+    } catch (error) {
+        console.error(`[baibaoku] Could not backup chat for ${name}`, error);
+    }
 }
 
 function makeAssistantMessage(job, timestamp) {
