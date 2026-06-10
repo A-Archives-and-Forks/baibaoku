@@ -27,6 +27,7 @@ const DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = false;
 const DEFAULT_TOKENIZER_BULK_COUNT_ENABLED = true;
+const DEFAULT_EXTENSION_MANIFEST_BUNDLE_ENABLED = true;
 const SETTINGS_AUTOSAVE_INTERVAL = 10 * 60 * 1000;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
 const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
@@ -2071,6 +2072,7 @@ async function getSettingsFastConfig(req, manager) {
         recentChatListAccelerationEnabled: value.recentChatListAccelerationEnabled !== false,
         progressiveChatLoadingEnabled: value.progressiveChatLoadingEnabled === true,
         tokenizerBulkCountEnabled: value.tokenizerBulkCountEnabled !== false,
+        extensionManifestBundleEnabled: value.extensionManifestBundleEnabled !== false,
     };
 }
 
@@ -2093,6 +2095,9 @@ async function setSettingsFastConfig(req, manager) {
         tokenizerBulkCountEnabled: req.body?.tokenizerBulkCountEnabled === undefined
             ? current.tokenizerBulkCountEnabled !== false
             : req.body.tokenizerBulkCountEnabled !== false,
+        extensionManifestBundleEnabled: req.body?.extensionManifestBundleEnabled === undefined
+            ? current.extensionManifestBundleEnabled !== false
+            : req.body.extensionManifestBundleEnabled !== false,
     };
 
     await manager.set(
@@ -2118,6 +2123,7 @@ async function getSettingsFastConfigSafe(req, manager) {
             recentChatListAccelerationEnabled: DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED,
             progressiveChatLoadingEnabled: DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED,
             tokenizerBulkCountEnabled: DEFAULT_TOKENIZER_BULK_COUNT_ENABLED,
+            extensionManifestBundleEnabled: DEFAULT_EXTENSION_MANIFEST_BUNDLE_ENABLED,
         };
     }
 }
@@ -2133,6 +2139,7 @@ function makeEarlyBridgeScript(options = {}) {
     const characterListAccelerationEnabled = options.characterListAccelerationEnabled !== false;
     const recentChatListAccelerationEnabled = options.recentChatListAccelerationEnabled !== false;
     const tokenizerBulkCountEnabled = options.tokenizerBulkCountEnabled !== false;
+    const extensionManifestBundleEnabled = options.extensionManifestBundleEnabled !== false;
 
     return `/* baibaoku early bridge v${EARLY_BRIDGE_VERSION} */
 (function () {
@@ -2149,6 +2156,7 @@ function makeEarlyBridgeScript(options = {}) {
   var CHARACTER_LIST_ACCELERATION_ENABLED = ${JSON.stringify(characterListAccelerationEnabled)};
   var RECENT_CHAT_LIST_ACCELERATION_ENABLED = ${JSON.stringify(recentChatListAccelerationEnabled)};
   var TOKENIZER_BULK_COUNT_ENABLED = ${JSON.stringify(tokenizerBulkCountEnabled)};
+  var EXTENSION_MANIFEST_BUNDLE_ENABLED = ${JSON.stringify(extensionManifestBundleEnabled)};
 
   if (window[FLAG] && window[FLAG].installed) {
     return;
@@ -2184,6 +2192,13 @@ function makeEarlyBridgeScript(options = {}) {
   state.settingsSavePending = null;
   state.extensionManifestBundleCache = state.extensionManifestBundleCache || null;
   state.extensionManifestBundlePending = null;
+
+  function clearExtensionManifestBundleCache(reason) {
+    state.extensionManifestBundleCache = null;
+    state.extensionManifestBundlePending = null;
+    state.lastExtensionManifestBundleInvalidationReason = reason || 'unknown';
+    state.lastExtensionManifestBundleInvalidatedAt = Date.now();
+  }
 
   function writeSettingsAccelerationEnabled(enabled) {
     var next = Boolean(enabled);
@@ -2232,6 +2247,20 @@ function makeEarlyBridgeScript(options = {}) {
   };
   state.setTokenizerBulkCountEnabled = writeTokenizerBulkCountEnabled;
   state.tokenizerBulkCountEnabled = TOKENIZER_BULK_COUNT_ENABLED;
+
+  function writeExtensionManifestBundleEnabled(enabled) {
+    state.extensionManifestBundleEnabled = Boolean(enabled);
+    if (state.extensionManifestBundleEnabled === false) {
+      clearExtensionManifestBundleCache('extension-manifest-bundle-disabled');
+    }
+    return state.extensionManifestBundleEnabled;
+  }
+
+  state.isExtensionManifestBundleEnabled = function () {
+    return state.extensionManifestBundleEnabled !== false;
+  };
+  state.setExtensionManifestBundleEnabled = writeExtensionManifestBundleEnabled;
+  state.extensionManifestBundleEnabled = EXTENSION_MANIFEST_BUNDLE_ENABLED;
 
   function toUrl(input) {
     try {
@@ -2700,7 +2729,7 @@ function makeEarlyBridgeScript(options = {}) {
   async function shouldUseFastRoute(route, input, init) {
     if (!route) return false;
     if (route.kind === 'extensionDiscover' || route.kind === 'extensionManifest') {
-      return true;
+      return state.extensionManifestBundleEnabled !== false;
     }
     if (route.kind === 'characters') {
       if (state.characterListAccelerationEnabled === false) return false;
