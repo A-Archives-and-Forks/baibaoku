@@ -453,8 +453,10 @@ GET  /api/plugins/baibaoku/v1/chats/save-generate/:jobId
 `pending?chatId=...` returns the latest save-generate job for the current user
 and chat id. This lets the frontend recover the job id after a page refresh or
 mobile browser resume while generation is still running.
-If `lastMessageHash` is provided and it matches the saved job message content,
-the endpoint returns `data: null` because the frontend already has the result.
+If `lastMessageHash` is provided and it matches the saved job message floor and
+content, the endpoint returns `data: null` because the frontend already has the
+result. The hash should be calculated from the last visible message floor number
+and `mes` content.
 
 Terminal statuses:
 ```text

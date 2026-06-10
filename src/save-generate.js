@@ -133,6 +133,7 @@ function createSaveGenerateJob(req) {
         descriptor,
         generate: structuredClone(generate),
         savedMessage: null,
+        savedMessageFloor: null,
         conflict: null,
         alreadySaved: false,
     };
@@ -759,7 +760,8 @@ async function saveGeneratedMessageLocked(job) {
     const chat = await readJsonlChat(job.descriptor.filePath);
     const currentVersion = await getChatVersion(job.descriptor.filePath);
     const expectedVersion = job.save.expectedVersion;
-    const existingLastMessage = getLastChatMessage(chat);
+    const existingLastMessageInfo = getLastChatMessageInfo(chat);
+    const existingLastMessage = existingLastMessageInfo.message;
     const generationType = getSaveGenerateType(job.save, job.generate);
 
     if (isSameGeneratedMessage(existingLastMessage, job)) {
@@ -767,6 +769,7 @@ async function saveGeneratedMessageLocked(job) {
             status: 'already_saved',
             alreadySaved: true,
             savedMessage: existingLastMessage,
+            savedMessageFloor: existingLastMessageInfo.floor,
             savedAt: Date.now(),
             finishedAt: Date.now(),
         });
@@ -790,6 +793,7 @@ async function saveGeneratedMessageLocked(job) {
     const baseChat = generationType === 'regenerate'
         ? removeLastRegeneratedMessage(chat)
         : chat;
+    const savedMessageFloor = countSaveGenerateChatMessages(baseChat);
     const nextChat = appendChatMessage(baseChat, message);
     const preWriteVersion = await getChatVersion(job.descriptor.filePath);
 
@@ -817,6 +821,7 @@ async function saveGeneratedMessageLocked(job) {
     touchSaveGenerateJob(job, {
         status: 'saved',
         savedMessage: message,
+        savedMessageFloor,
         savedAt: Date.now(),
         finishedAt: Date.now(),
     });
@@ -905,19 +910,35 @@ function isSameGeneratedMessage(message, job) {
         && String(message.extra?.model || '') === String(job.generate.model || '');
 }
 
-function getLastChatMessage(chat) {
+function getLastChatMessageInfo(chat) {
+    const info = {
+        message: null,
+        floor: -1,
+    };
+
     if (!Array.isArray(chat) || chat.length === 0) {
-        return null;
+        return info;
     }
 
-    for (let index = chat.length - 1; index >= 0; index -= 1) {
-        const item = chat[index];
-        if (item && !item.chat_metadata) {
-            return item;
+    let floor = -1;
+    for (const item of chat) {
+        if (!item || item.chat_metadata) {
+            continue;
         }
+        floor += 1;
+        info.message = item;
+        info.floor = floor;
     }
 
-    return null;
+    return info;
+}
+
+function countSaveGenerateChatMessages(chat) {
+    if (!Array.isArray(chat) || chat.length === 0) {
+        return 0;
+    }
+
+    return chat.reduce((count, item) => count + (item && !item.chat_metadata ? 1 : 0), 0);
 }
 
 async function readJsonlChat(filePath) {
@@ -1045,6 +1066,7 @@ function serializeSaveGenerateJob(job) {
         resultText: job.resultText,
         reasoning: job.reasoning,
         savedMessage: job.savedMessage,
+        savedMessageFloor: job.savedMessageFloor,
         conflict: job.conflict,
         alreadySaved: job.alreadySaved,
         error: job.error,
@@ -1128,18 +1150,37 @@ function isSaveGenerateLastMessageHashMatch(job, lastMessageHash) {
         return false;
     }
 
+    const expectedFloor = parseSaveGenerateMessageHashFloor(expectedHash);
+    const savedFloor = Number.isInteger(job?.savedMessageFloor) ? job.savedMessageFloor : -1;
+    if (Number.isInteger(expectedFloor) && Number.isInteger(savedFloor) && expectedFloor > savedFloor) {
+        return true;
+    }
+
     const savedText = job?.savedMessage?.mes ?? job?.resultText ?? '';
-    return makeSaveGenerateMessageContentHash(savedText) === expectedHash;
+    return makeSaveGenerateMessageContentHash(savedText, savedFloor) === expectedHash;
 }
 
-function makeSaveGenerateMessageContentHash(value) {
+function parseSaveGenerateMessageHashFloor(value) {
+    const match = /^m(\d+):/.exec(String(value || ''));
+    if (!match) {
+        return null;
+    }
+
+    const floor = Number(match[1]);
+    return Number.isInteger(floor) && floor >= 0 ? floor : null;
+}
+
+function makeSaveGenerateMessageContentHash(value, floor) {
     const text = String(value ?? '');
+    const numericFloor = floor === null || floor === undefined ? -1 : Number(floor);
+    const normalizedFloor = Number.isInteger(numericFloor) && numericFloor >= 0 ? numericFloor : -1;
+    const hashInput = `${normalizedFloor}\n${text}`;
     let hash = 0x811c9dc5;
-    for (let index = 0; index < text.length; index += 1) {
-        hash ^= text.charCodeAt(index);
+    for (let index = 0; index < hashInput.length; index += 1) {
+        hash ^= hashInput.charCodeAt(index);
         hash = Math.imul(hash, 0x01000193);
     }
-    return `${text.length.toString(36)}:${(hash >>> 0).toString(16).padStart(8, '0')}`;
+    return `m${normalizedFloor}:${text.length.toString(36)}:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
 function throwHttpError(message, status) {
