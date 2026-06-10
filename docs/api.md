@@ -446,6 +446,8 @@ failures.
 Poll status:
 ```text
 POST /api/plugins/baibaoku/v1/chats/save-generate/status
+POST /api/plugins/baibaoku/v1/chats/save-generate/cancel
+POST /api/plugins/baibaoku/v1/chats/save-generate/:jobId/cancel
 GET  /api/plugins/baibaoku/v1/chats/save-generate/pending?chatId=...&lastMessageHash=...
 GET  /api/plugins/baibaoku/v1/chats/save-generate/:jobId
 ```
@@ -464,4 +466,9 @@ saved
 already_saved
 conflict
 failed
+canceled
 ```
+
+Cancel accepts either `jobId` or `chatId` in the request body. If cancellation
+happens during generation, already streamed partial text is discarded and is not
+saved to the chat file.

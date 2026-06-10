@@ -68,6 +68,32 @@ export function registerSaveGenerateEndpoints(router) {
         }
     });
 
+    router.post('/v1/chats/save-generate/cancel', (req, res) => {
+        try {
+            res.json({
+                ok: true,
+                data: cancelSaveGenerateJobForRequest(
+                    req,
+                    req.body?.jobId || req.body?.id,
+                    req.body?.chatId || req.body?.chat_id,
+                ),
+            });
+        } catch (error) {
+            res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
+        }
+    });
+
+    router.post('/v1/chats/save-generate/:jobId/cancel', (req, res) => {
+        try {
+            res.json({
+                ok: true,
+                data: cancelSaveGenerateJobForRequest(req, req.params?.jobId),
+            });
+        } catch (error) {
+            res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
+        }
+    });
+
     router.get('/v1/chats/save-generate/pending', (req, res) => {
         try {
             res.json({
@@ -138,6 +164,8 @@ function createSaveGenerateJob(req) {
         reasoning: '',
         responseStatus: null,
         responseStatusText: '',
+        cancelRequested: false,
+        canceledAt: null,
         save: {
             kind: descriptor.kind,
             type: getSaveGenerateType(save, generate),
@@ -153,6 +181,8 @@ function createSaveGenerateJob(req) {
         savedMessageFloor: null,
         conflict: null,
         alreadySaved: false,
+        generateRequestSocket: null,
+        captureResponse: null,
     };
 
     saveGenerateJobs.set(id, job);
@@ -226,6 +256,10 @@ function resolveSaveGenerateChatFile(req, save) {
 }
 
 async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
+    if (job.cancelRequested) {
+        throw makeSaveGenerateCancelError();
+    }
+
     touchSaveGenerateJob(job, {
         status: job.generate.stream === true ? 'streaming' : 'running',
         startedAt: Date.now(),
@@ -246,6 +280,10 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
     try {
         response = await invokeChatCompletionsGenerate(job, {
             onChunk: chunk => {
+                if (job.cancelRequested) {
+                    return;
+                }
+
                 if (job.generate.stream === true) {
                     const clientChunks = streamState.push(chunk);
                     if (streamState.text || streamState.reasoning) {
@@ -279,7 +317,15 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
 
         touchSaveGenerateJob(job, { generateFinishedAt: Date.now() });
 
+        if (job.cancelRequested) {
+            throw makeSaveGenerateCancelError();
+        }
+
         if (response.statusCode < 200 || response.statusCode >= 300) {
+            if (job.cancelRequested) {
+                throw makeSaveGenerateCancelError();
+            }
+
             if (job.generate.stream === true && streamState.text) {
                 await finishGeneratedResult(job, {
                     text: streamState.text,
@@ -315,6 +361,12 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
         endStreamResponse(streamResponse, clientOpen);
         return { job, response };
     } catch (error) {
+        if (isSaveGenerateCancelError(error) || job.cancelRequested) {
+            cancelSaveGenerateJob(job);
+            endStreamResponse(streamResponse, clientOpen);
+            return { job, response };
+        }
+
         if (job.generate.stream === true && streamState.text) {
             await finishGeneratedResult(job, {
                 text: streamState.text,
@@ -346,6 +398,11 @@ async function finishGeneratedResult(job, result) {
 }
 
 function sendCapturedGenerateResponse(res, response, job) {
+    if (job?.status === 'canceled') {
+        res.status(499).json({ error: { message: 'Generation canceled' }, canceled: true });
+        return;
+    }
+
     if (!response) {
         res.status(500).json({ error: { message: 'save-generate did not produce a response' } });
         return;
@@ -475,23 +532,31 @@ function copyCaptureHeadersToStream(streamResponse, capture) {
 async function invokeChatCompletionsGenerate(job, { onChunk, onStatus }) {
     const fakeReq = createGenerateRequest(job);
     const capture = new CaptureResponse({ onChunk, onStatus });
+    job.captureResponse = capture;
 
-    chatCompletionsRouter.handle(fakeReq, capture, error => {
-        if (error) {
-            capture.fail(error);
-        } else if (!capture.writableEnded) {
-            capture.end();
+    try {
+        chatCompletionsRouter.handle(fakeReq, capture, error => {
+            if (error) {
+                capture.fail(error);
+            } else if (!capture.writableEnded) {
+                capture.end();
+            }
+        });
+
+        await capture.done;
+        return {
+            statusCode: capture.statusCode,
+            statusMessage: capture.statusMessage,
+            headers: capture.headers,
+            body: capture.body,
+            bodyText: capture.body.toString('utf8'),
+        };
+    } finally {
+        if (job.captureResponse === capture) {
+            job.captureResponse = null;
         }
-    });
-
-    await capture.done;
-    return {
-        statusCode: capture.statusCode,
-        statusMessage: capture.statusMessage,
-        headers: capture.headers,
-        body: capture.body,
-        bodyText: capture.body.toString('utf8'),
-    };
+        job.generateRequestSocket = null;
+    }
 }
 
 function createGenerateRequest(job) {
@@ -499,6 +564,7 @@ function createGenerateRequest(job) {
     socket.destroyed = false;
     socket.writable = true;
     socket.setTimeout = () => socket;
+    job.generateRequestSocket = socket;
 
     return {
         method: 'POST',
@@ -1109,6 +1175,57 @@ function getSaveGenerateJobForRequest(req, jobId) {
     return serializeSaveGenerateJob(job);
 }
 
+function cancelSaveGenerateJobForRequest(req, jobId, chatId = '') {
+    cleanupSaveGenerateJobs();
+
+    const userHandle = req.user?.profile?.handle;
+    if (!userHandle) {
+        throwHttpError('Unauthorized', 401);
+    }
+
+    const job = findSaveGenerateJobToCancel(userHandle, jobId, chatId);
+    if (!job) {
+        throwHttpError('cancelable save-generate job was not found', 404);
+    }
+
+    cancelSaveGenerateJob(job);
+    return serializeSaveGenerateJob(job);
+}
+
+function findSaveGenerateJobToCancel(userHandle, jobId, chatId = '') {
+    const id = String(jobId || '');
+    if (id) {
+        const job = saveGenerateJobs.get(id);
+        if (!job || job.userHandle !== userHandle) {
+            return null;
+        }
+        return job;
+    }
+
+    const normalizedChatId = normalizeChatId(chatId);
+    if (!normalizedChatId) {
+        throwHttpError('jobId or chatId is required', 400);
+    }
+
+    let latest = null;
+    for (const job of saveGenerateJobs.values()) {
+        if (!job || job.userHandle !== userHandle || !isSaveGenerateCancelableStatus(job.status)) {
+            continue;
+        }
+
+        const jobChatId = normalizeChatId(job.save?.chatId || job.save?.file_name);
+        if (jobChatId !== normalizedChatId) {
+            continue;
+        }
+
+        if (!latest || Number(job.updatedAt || 0) > Number(latest.updatedAt || 0)) {
+            latest = job;
+        }
+    }
+
+    return latest;
+}
+
 function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '') {
     cleanupSaveGenerateJobs();
 
@@ -1174,6 +1291,8 @@ function serializeSaveGenerateJob(job) {
         savedAt: job.savedAt,
         responseStatus: job.responseStatus,
         responseStatusText: job.responseStatusText,
+        cancelRequested: job.cancelRequested,
+        canceledAt: job.canceledAt,
         save: job.save,
         resultText: job.resultText,
         reasoning: job.reasoning,
@@ -1198,6 +1317,50 @@ function failSaveGenerateJob(job, error) {
             status: error?.status || null,
         },
     });
+}
+
+function cancelSaveGenerateJob(job) {
+    if (!job || !isSaveGenerateCancelableStatus(job.status)) {
+        return;
+    }
+
+    const now = Date.now();
+    job.cancelRequested = true;
+    job.canceledAt = job.canceledAt || now;
+
+    closeSaveGenerateJobSockets(job);
+
+    touchSaveGenerateJob(job, {
+        status: 'canceled',
+        finishedAt: now,
+        generateFinishedAt: job.generateFinishedAt || now,
+        resultText: '',
+        reasoning: '',
+        savedMessage: null,
+        savedMessageFloor: null,
+        error: {
+            message: 'Generation canceled',
+            status: 499,
+        },
+    });
+}
+
+function closeSaveGenerateJobSockets(job) {
+    emitSaveGenerateSocketClose(job?.generateRequestSocket);
+    emitSaveGenerateSocketClose(job?.captureResponse?.socket);
+
+    if (job?.captureResponse && !job.captureResponse.writableEnded && !job.captureResponse.destroyed) {
+        job.captureResponse.destroy(makeSaveGenerateCancelError());
+    }
+}
+
+function emitSaveGenerateSocketClose(socket) {
+    if (!socket || socket.destroyed) {
+        return;
+    }
+
+    socket.destroyed = true;
+    socket.emit('close');
 }
 
 function cleanupSaveGenerateJobs() {
@@ -1249,11 +1412,26 @@ function getSaveGenerateType(save, generate) {
 }
 
 function isSaveGenerateTerminalStatus(status) {
-    return ['saved', 'already_saved', 'conflict', 'failed'].includes(status);
+    return ['saved', 'already_saved', 'conflict', 'failed', 'canceled'].includes(status);
 }
 
 function isSaveGenerateSavedStatus(status) {
     return ['saved', 'already_saved'].includes(status);
+}
+
+function isSaveGenerateCancelableStatus(status) {
+    return ['queued', 'running', 'streaming'].includes(status);
+}
+
+function makeSaveGenerateCancelError() {
+    const error = new Error('Generation canceled');
+    error.status = 499;
+    error.saveGenerateCanceled = true;
+    return error;
+}
+
+function isSaveGenerateCancelError(error) {
+    return Boolean(error?.saveGenerateCanceled || error?.name === 'AbortError' && error?.message === 'Generation canceled');
 }
 
 function isSaveGenerateLastMessageHashMatch(job, lastMessageHash) {
