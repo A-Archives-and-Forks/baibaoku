@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import bytes from 'bytes';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { parse } from '../../../src/character-card-parser.js';
-import { SETTINGS_FILE } from '../../../src/constants.js';
+import { PUBLIC_DIRECTORIES, SETTINGS_FILE } from '../../../src/constants.js';
 import { generateTimestamp, removeOldBackups } from '../../../src/util.js';
 import { PLUGIN_ID } from './constants.js';
 import {
@@ -1787,6 +1787,88 @@ async function getStaticSettingsPayload() {
     return staticSettingsPayload;
 }
 
+function buildExtensionManifestBundle(req) {
+    const userExtensionsDirectory = req.user?.directories?.extensions;
+
+    if (!userExtensionsDirectory) {
+        throw new Error('Current SillyTavern user extensions directory was not found.');
+    }
+
+    const builtInExtensions = readExtensionFolders(PUBLIC_DIRECTORIES.extensions)
+        .filter(folder => folder !== 'third-party')
+        .map(folder => ({ type: 'system', name: folder }));
+
+    const userExtensions = readExtensionFolders(userExtensionsDirectory)
+        .map(folder => ({ type: 'local', name: `third-party/${folder}` }));
+
+    const globalExtensions = readExtensionFolders(PUBLIC_DIRECTORIES.globalExtensions)
+        .map(folder => ({ type: 'global', name: `third-party/${folder}` }))
+        .filter(extension => !userExtensions.some(userExtension => userExtension.name === extension.name));
+
+    const extensions = [...builtInExtensions, ...userExtensions, ...globalExtensions];
+    const manifests = {};
+    const missing = {};
+    const invalid = {};
+
+    for (const extension of extensions) {
+        const manifestPath = getExtensionManifestPath(req, extension);
+
+        try {
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+                throw new Error('Manifest is not a valid JSON object.');
+            }
+            manifests[extension.name] = manifest;
+        } catch (error) {
+            const bucket = error?.code === 'ENOENT' ? missing : invalid;
+            bucket[extension.name] = {
+                path: manifestPath,
+                message: error?.message || String(error),
+            };
+        }
+    }
+
+    return {
+        extensions,
+        manifests,
+        missing,
+        invalid,
+        generatedAt: Date.now(),
+    };
+}
+
+function readExtensionFolders(directory) {
+    if (!fs.existsSync(directory)) {
+        fs.mkdirSync(directory, { recursive: true });
+    }
+
+    return fs.readdirSync(directory)
+        .filter(folder => {
+            try {
+                return fs.statSync(path.join(directory, folder)).isDirectory();
+            } catch {
+                return false;
+            }
+        });
+}
+
+function getExtensionManifestPath(req, extension) {
+    switch (extension.type) {
+        case 'system':
+            return path.join(PUBLIC_DIRECTORIES.extensions, extension.name, 'manifest.json');
+        case 'local':
+            return path.join(req.user.directories.extensions, getThirdPartyExtensionFolder(extension.name), 'manifest.json');
+        case 'global':
+            return path.join(PUBLIC_DIRECTORIES.globalExtensions, getThirdPartyExtensionFolder(extension.name), 'manifest.json');
+        default:
+            throw new Error(`Unknown extension type: ${extension.type}`);
+    }
+}
+
+function getThirdPartyExtensionFolder(name) {
+    return String(name || '').replace(/^third-party[\\/]/, '');
+}
+
 async function getFastSettingsResponse(req, userHandle, settingsInfo, cachedPayload, staticPayload) {
     const key = getFastSettingsResponseKey(userHandle, settingsInfo, staticPayload);
     const cached = settingsResponseCaches.get(userHandle);
@@ -2046,6 +2128,7 @@ function makeEarlyBridgeScript(options = {}) {
     const fastSettingsSavePath = `${apiPrefix}/v1/settings/fast-save`;
     const fastCharacterListPath = `${apiPrefix}/v1/characters/fast-all`;
     const fastRecentChatListPath = `${apiPrefix}/v1/chats/fast-recent`;
+    const extensionManifestBundlePath = `${apiPrefix}/v1/extensions/manifest-bundle`;
     const settingsAccelerationEnabled = options.settingsAccelerationEnabled !== false;
     const characterListAccelerationEnabled = options.characterListAccelerationEnabled !== false;
     const recentChatListAccelerationEnabled = options.recentChatListAccelerationEnabled !== false;
@@ -2061,6 +2144,7 @@ function makeEarlyBridgeScript(options = {}) {
   var FAST_SETTINGS_SAVE = ${JSON.stringify(fastSettingsSavePath)};
   var FAST_CHARACTER_LIST = ${JSON.stringify(fastCharacterListPath)};
   var FAST_RECENT_CHAT_LIST = ${JSON.stringify(fastRecentChatListPath)};
+  var EXTENSION_MANIFEST_BUNDLE = ${JSON.stringify(extensionManifestBundlePath)};
   var SETTINGS_ACCELERATION_ENABLED = ${JSON.stringify(settingsAccelerationEnabled)};
   var CHARACTER_LIST_ACCELERATION_ENABLED = ${JSON.stringify(characterListAccelerationEnabled)};
   var RECENT_CHAT_LIST_ACCELERATION_ENABLED = ${JSON.stringify(recentChatListAccelerationEnabled)};
@@ -2086,14 +2170,20 @@ function makeEarlyBridgeScript(options = {}) {
   state.fastSavePath = FAST_SETTINGS_SAVE;
   state.fastCharacterListPath = FAST_CHARACTER_LIST;
   state.fastRecentChatListPath = FAST_RECENT_CHAT_LIST;
-  state.requests = state.requests || { get: 0, save: 0, characters: 0, recentChats: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
+  state.extensionManifestBundlePath = EXTENSION_MANIFEST_BUNDLE;
+  state.requests = state.requests || { get: 0, save: 0, characters: 0, recentChats: 0, extensionBundle: 0, extensionManifest: 0, extensionManifestRefresh: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
   if (typeof state.requests.saveFrontendCache !== 'number') state.requests.saveFrontendCache = 0;
   if (typeof state.requests.recentChats !== 'number') state.requests.recentChats = 0;
+  if (typeof state.requests.extensionBundle !== 'number') state.requests.extensionBundle = 0;
+  if (typeof state.requests.extensionManifest !== 'number') state.requests.extensionManifest = 0;
+  if (typeof state.requests.extensionManifestRefresh !== 'number') state.requests.extensionManifestRefresh = 0;
   state.rawFetch = rawFetch;
   state.settingsGetCache = state.settingsGetCache || null;
   state.settingsGetPending = null;
   state.settingsSaveCache = state.settingsSaveCache || null;
   state.settingsSavePending = null;
+  state.extensionManifestBundleCache = state.extensionManifestBundleCache || null;
+  state.extensionManifestBundlePending = null;
 
   function writeSettingsAccelerationEnabled(enabled) {
     var next = Boolean(enabled);
@@ -2157,12 +2247,29 @@ function makeEarlyBridgeScript(options = {}) {
   }
 
   function shouldIntercept(url, method) {
-    if (!url || url.origin !== location.origin || method !== 'POST') return null;
+    if (!url || url.origin !== location.origin) return null;
+    if (method === 'GET') {
+      if (url.pathname === '/api/extensions/discover') return { kind: 'extensionDiscover', fastPath: EXTENSION_MANIFEST_BUNDLE };
+      var manifestName = getManifestRequestName(url);
+      if (manifestName) return { kind: 'extensionManifest', name: manifestName };
+      return null;
+    }
+    if (method !== 'POST') return null;
     if (url.pathname === '/api/settings/get') return { kind: 'get', fastPath: FAST_SETTINGS_GET };
     if (url.pathname === '/api/settings/save') return { kind: 'save', fastPath: FAST_SETTINGS_SAVE };
     if (url.pathname === '/api/characters/all') return { kind: 'characters', fastPath: FAST_CHARACTER_LIST };
     if (url.pathname === '/api/chats/recent') return { kind: 'recentChats', fastPath: FAST_RECENT_CHAT_LIST };
     return null;
+  }
+
+  function getManifestRequestName(url) {
+    var match = /^\\/scripts\\/extensions\\/(.+)\\/manifest\\.json$/i.exec(url.pathname || '');
+    if (!match) return null;
+    try {
+      return decodeURIComponent(match[1]);
+    } catch (_) {
+      return match[1];
+    }
   }
 
   function shouldInvalidateSettingsGetCache(url, method) {
@@ -2218,6 +2325,233 @@ function makeEarlyBridgeScript(options = {}) {
       statusText: cache.statusText || 'OK',
       headers: headers,
     });
+  }
+
+  function makeJsonResponse(data, headers, status) {
+    var responseHeaders = new Headers(headers || undefined);
+    responseHeaders.set('content-type', 'application/json; charset=utf-8');
+    return new Response(JSON.stringify(data), {
+      status: status || 200,
+      statusText: status && status >= 400 ? 'Error' : 'OK',
+      headers: responseHeaders,
+    });
+  }
+
+  function makeTextResponse(text, status, headers) {
+    var responseHeaders = new Headers(headers || undefined);
+    responseHeaders.set('content-type', 'text/plain; charset=utf-8');
+    return new Response(text || '', {
+      status: status || 200,
+      statusText: status && status >= 400 ? 'Error' : 'OK',
+      headers: responseHeaders,
+    });
+  }
+
+  function hasOwn(object, key) {
+    return Object.prototype.hasOwnProperty.call(object || {}, key);
+  }
+
+  function normalizeExtensionManifestBundle(bundle) {
+    if (!bundle || !Array.isArray(bundle.extensions) || !bundle.manifests || typeof bundle.manifests !== 'object') {
+      throw new Error('Extension manifest bundle payload is invalid');
+    }
+
+    bundle.missing = bundle.missing && typeof bundle.missing === 'object' ? bundle.missing : {};
+    bundle.invalid = bundle.invalid && typeof bundle.invalid === 'object' ? bundle.invalid : {};
+    return bundle;
+  }
+
+  async function fetchExtensionManifestBundle(force) {
+    if (!force && state.extensionManifestBundleCache) {
+      return state.extensionManifestBundleCache;
+    }
+    if (!force && state.extensionManifestBundlePending) {
+      return state.extensionManifestBundlePending;
+    }
+
+    state.requests.extensionBundle += 1;
+    state.extensionManifestBundlePending = rawFetch(EXTENSION_MANIFEST_BUNDLE, {
+      method: 'GET',
+      cache: 'no-store',
+    }).then(async function (response) {
+      if (!response || !response.ok) {
+        throw new Error('Extension manifest bundle request failed: ' + (response ? response.status : 'no response'));
+      }
+
+      var bundle = normalizeExtensionManifestBundle(await response.json());
+      state.extensionManifestBundleCache = bundle;
+      state.lastExtensionManifestBundleAt = Date.now();
+      return bundle;
+    }).finally(function () {
+      state.extensionManifestBundlePending = null;
+    });
+
+    return state.extensionManifestBundlePending;
+  }
+
+  async function makeExtensionDiscoverResponse() {
+    var bundle = await fetchExtensionManifestBundle(false);
+    return makeJsonResponse(bundle.extensions, {
+      'x-baibaoku-extension-manifest-bundle': 'discover',
+    });
+  }
+
+  async function makeExtensionManifestResponse(route) {
+    var bundle = await fetchExtensionManifestBundle(false);
+    var name = route && route.name;
+
+    state.requests.extensionManifest += 1;
+    if (hasOwn(bundle.manifests, name)) {
+      return makeJsonResponse(bundle.manifests[name], {
+        'x-baibaoku-extension-manifest-cache': 'hit',
+        'x-baibaoku-extension-name': name,
+      });
+    }
+
+    if (hasOwn(bundle.invalid, name)) {
+      return makeTextResponse('Invalid manifest.json for ' + name, 500, {
+        'x-baibaoku-extension-manifest-cache': 'invalid',
+        'x-baibaoku-extension-name': name,
+      });
+    }
+
+    return makeTextResponse('Manifest not found for ' + name, 404, {
+      'x-baibaoku-extension-manifest-cache': 'missing',
+      'x-baibaoku-extension-name': name,
+    });
+  }
+
+  function normalizeThirdPartyExtensionName(value) {
+    var name = String(value || '').replace(/\\\\/g, '/').trim();
+    if (!name) return null;
+    name = name.replace(/^\\/+/, '');
+    if (name.indexOf('third-party/') === 0) return name;
+    if (name === 'third-party') return null;
+    if (name.indexOf('third-party') === 0) {
+      name = name.slice('third-party'.length).replace(/^\\/+/, '');
+    }
+    return name ? 'third-party/' + name : null;
+  }
+
+  function encodeExtensionManifestPath(name) {
+    return String(name || '')
+      .split('/')
+      .map(function (part) { return encodeURIComponent(part); })
+      .join('/');
+  }
+
+  function addOrUpdateExtensionEntry(bundle, name, type) {
+    if (!bundle || !name) return;
+    var extensionType = type || 'local';
+    var existing = bundle.extensions.find(function (extension) { return extension && extension.name === name; });
+    if (existing) {
+      existing.type = extensionType || existing.type;
+      return;
+    }
+    bundle.extensions.push({ type: extensionType, name: name });
+  }
+
+  function removeExtensionEntry(bundle, name) {
+    if (!bundle || !name) return;
+    bundle.extensions = bundle.extensions.filter(function (extension) { return !extension || extension.name !== name; });
+    delete bundle.manifests[name];
+    delete bundle.invalid[name];
+    bundle.missing[name] = {
+      message: 'Extension was removed during this page session.',
+      removedAt: Date.now(),
+    };
+  }
+
+  async function refreshCachedExtensionManifest(name) {
+    var bundle = state.extensionManifestBundleCache;
+    if (!bundle || !name) return;
+
+    state.requests.extensionManifestRefresh += 1;
+    var url = '/scripts/extensions/' + encodeExtensionManifestPath(name) + '/manifest.json?baibaoku_refresh=' + Date.now();
+
+    try {
+      var response = await rawFetch(url, { method: 'GET', cache: 'no-store' });
+      await updateCachedExtensionManifestFromResponse(bundle, name, response);
+    } catch (error) {
+      delete bundle.manifests[name];
+      delete bundle.missing[name];
+      bundle.invalid[name] = {
+        message: error && error.message ? error.message : String(error),
+        refreshedAt: Date.now(),
+      };
+    }
+  }
+
+  async function updateCachedExtensionManifestFromResponse(bundle, name, response) {
+    delete bundle.manifests[name];
+    delete bundle.missing[name];
+    delete bundle.invalid[name];
+
+    if (!response || !response.ok) {
+      bundle.missing[name] = {
+        status: response ? response.status : 0,
+        statusText: response ? response.statusText : '',
+        refreshedAt: Date.now(),
+      };
+      return;
+    }
+
+    try {
+      var manifest = await response.json();
+      if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+        throw new Error('Manifest is not a valid JSON object.');
+      }
+      bundle.manifests[name] = manifest;
+    } catch (error) {
+      bundle.invalid[name] = {
+        message: error && error.message ? error.message : String(error),
+        refreshedAt: Date.now(),
+      };
+    }
+  }
+
+  async function refreshExtensionManifestCacheAfterMutation(url, input, init, response) {
+    if (!state.extensionManifestBundleCache || !response || !response.ok || !url || url.origin !== location.origin || getMethod(input, init) !== 'POST') {
+      return;
+    }
+
+    var path = url.pathname;
+    if (path !== '/api/extensions/install'
+      && path !== '/api/extensions/delete'
+      && path !== '/api/extensions/update'
+      && path !== '/api/extensions/move'
+      && path !== '/api/extensions/switch') {
+      return;
+    }
+
+    var body = await readJsonBody(input, init) || {};
+    var bundle = state.extensionManifestBundleCache;
+    var name = normalizeThirdPartyExtensionName(body.extensionName);
+
+    if (path === '/api/extensions/install') {
+      var installPayload = await response.clone().json().catch(function () { return null; });
+      name = normalizeThirdPartyExtensionName(installPayload && installPayload.folderName);
+      if (name) {
+        addOrUpdateExtensionEntry(bundle, name, body.global ? 'global' : 'local');
+        await refreshCachedExtensionManifest(name);
+      }
+      return;
+    }
+
+    if (!name) return;
+
+    if (path === '/api/extensions/delete') {
+      removeExtensionEntry(bundle, name);
+      return;
+    }
+
+    if (path === '/api/extensions/move') {
+      addOrUpdateExtensionEntry(bundle, name, body.destination === 'global' ? 'global' : 'local');
+      await refreshCachedExtensionManifest(name);
+      return;
+    }
+
+    await refreshCachedExtensionManifest(name);
   }
 
   async function cacheSettingsGetResponse(response) {
@@ -2365,6 +2699,9 @@ function makeEarlyBridgeScript(options = {}) {
 
   async function shouldUseFastRoute(route, input, init) {
     if (!route) return false;
+    if (route.kind === 'extensionDiscover' || route.kind === 'extensionManifest') {
+      return true;
+    }
     if (route.kind === 'characters') {
       if (state.characterListAccelerationEnabled === false) return false;
       return isPlainEmptyObject(await readJsonBody(input, init));
@@ -2415,6 +2752,12 @@ function makeEarlyBridgeScript(options = {}) {
 
     if (!await shouldUseFastRoute(route, input, init)) {
       var originalResponse = await rawFetch(input, init);
+      try {
+        await refreshExtensionManifestCacheAfterMutation(url, input, init, originalResponse);
+      } catch (error) {
+        state.requests.errors += 1;
+        state.lastExtensionManifestRefreshError = error && error.message ? error.message : String(error);
+      }
       if (originalResponse && originalResponse.ok && shouldInvalidateSettingsGetCache(url, method)) {
         clearSettingsGetCache('mutation:' + url.pathname);
         if (url.pathname === '/api/settings/save') {
@@ -2424,9 +2767,17 @@ function makeEarlyBridgeScript(options = {}) {
       return originalResponse;
     }
 
-    state.requests[route.kind] += 1;
-
     try {
+      if (route.kind === 'extensionDiscover') {
+        return await makeExtensionDiscoverResponse();
+      }
+
+      if (route.kind === 'extensionManifest') {
+        return await makeExtensionManifestResponse(route);
+      }
+
+      state.requests[route.kind] += 1;
+
       if (route.kind === 'get') {
         if (state.settingsGetCache) {
           state.requests.frontendCache += 1;
@@ -2614,6 +2965,16 @@ export function closeStEndpointCaches() {
 }
 
 export function registerStEndpoints(router, manager) {
+    router.get('/v1/extensions/manifest-bundle', (req, res) => {
+        try {
+            res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+            res.json(buildExtensionManifestBundle(req));
+        } catch (error) {
+            console.error('[baibaoku] Error in extension manifest bundle endpoint:', error);
+            res.status(500).json({ error: true, message: error.message });
+        }
+    });
+
     router.get('/v1/early/bridge.js', async (req, res) => {
         try {
             const config = await getSettingsFastConfigSafe(req, manager);
