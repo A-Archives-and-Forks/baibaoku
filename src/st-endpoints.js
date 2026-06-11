@@ -67,6 +67,7 @@ const settingsResponseCaches = new Map();
 const settingsBackupSchedulers = new Map();
 // Cache structure: Map<userHandle, string>
 const lastBackupTexts = new Map();
+const tokenizerLoadPromises = new WeakMap();
 let staticSettingsPayload = null;
 const EARLY_BRIDGE_VERSION = '0.5';
 
@@ -3393,7 +3394,7 @@ async function countSingleMessageBulk(model, resolvedModel, msg) {
     // 1. WebTokenizer models (claude, llama3, deepseek, qwen2, command-r/a, nemo)
     const webTokenizer = getWebTokenizer(resolvedModel);
     if (webTokenizer) {
-        const instance = await webTokenizer.get();
+        const instance = await getTokenizerInstanceBulk(webTokenizer);
         if (instance) return countWebTokenizerTokens(instance, [msg]);
         return guesstimateBulk(JSON.stringify([msg]));
     }
@@ -3426,7 +3427,7 @@ async function countSentencepieceArrayTokensBulk(tokenizer, array) {
 }
 
 async function countSentencepieceTokensBulk(tokenizer, text) {
-    const instance = await tokenizer?.get();
+    const instance = await getTokenizerInstanceBulk(tokenizer);
 
     if (!instance) {
         return {
@@ -3440,6 +3441,24 @@ async function countSentencepieceTokensBulk(tokenizer, text) {
         ids,
         count: ids.length,
     };
+}
+
+async function getTokenizerInstanceBulk(tokenizer) {
+    if (!tokenizer || typeof tokenizer.get !== 'function') {
+        return null;
+    }
+
+    let loadPromise = tokenizerLoadPromises.get(tokenizer);
+    if (!loadPromise) {
+        // ST tokenizer wrappers do not share an in-flight load, so a first-page bulk
+        // count can otherwise initialize the same SentencePiece model many times.
+        loadPromise = Promise.resolve()
+            .then(() => tokenizer.get())
+            .finally(() => tokenizerLoadPromises.delete(tokenizer));
+        tokenizerLoadPromises.set(tokenizer, loadPromise);
+    }
+
+    return loadPromise;
 }
 
 function guesstimateBulk(str) {
