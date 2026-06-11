@@ -92,6 +92,10 @@ export function registerSaveGenerateEndpoints(router) {
                     req,
                     req.query?.chatId || req.query?.chat_id,
                     req.query?.lastMessageHash || req.query?.last_message_hash,
+                    {
+                        floor: req.query?.lastMessageFloor ?? req.query?.last_message_floor,
+                        role: req.query?.lastMessageRole ?? req.query?.last_message_role,
+                    },
                 ),
             });
         } catch (error) {
@@ -1392,7 +1396,7 @@ function findSaveGenerateJobToCancel(userHandle, jobId, chatId = '') {
     return latest;
 }
 
-async function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '') {
+async function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '', lastMessageInfo = {}) {
     cleanupSaveGenerateJobs();
 
     const userHandle = req.user?.profile?.handle;
@@ -1449,6 +1453,11 @@ async function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '') {
     }
 
     if (isSaveGenerateSavedStatus(latestTerminal.status)
+        && isSaveGenerateClientTailAlreadyHasJob(latestTerminal, lastMessageInfo)) {
+        return null;
+    }
+
+    if (isSaveGenerateSavedStatus(latestTerminal.status)
         && isSaveGenerateLastMessageHashMatch(latestTerminal, lastMessageHash)) {
         return null;
     }
@@ -1471,12 +1480,14 @@ async function isSaveGenerateJobAlreadyAtChatTail(job) {
     try {
         const chat = await readJsonlChat(filePath);
         const lastMessageInfo = getLastChatMessageInfo(chat);
-        const savedFloor = Number.isInteger(job?.savedMessageFloor) ? job.savedMessageFloor : -1;
-        if (Number.isInteger(lastMessageInfo.floor) && Number.isInteger(savedFloor) && savedFloor >= 0 && lastMessageInfo.floor > savedFloor) {
+        const lastMessage = lastMessageInfo.message;
+        if (isSaveGenerateClientTailAlreadyHasJob(job, {
+            floor: lastMessageInfo.floor,
+            role: lastMessage ? (lastMessage.is_user === true ? 'user' : 'assistant') : '',
+        })) {
             return true;
         }
 
-        const lastMessage = lastMessageInfo.message;
         return Boolean(
             lastMessage
             && lastMessage.is_user !== true
@@ -1653,14 +1664,35 @@ function isSaveGenerateLastMessageHashMatch(job, lastMessageHash) {
         return false;
     }
 
-    const expectedFloor = parseSaveGenerateMessageHashFloor(expectedHash);
     const savedFloor = Number.isInteger(job?.savedMessageFloor) ? job.savedMessageFloor : -1;
-    if (Number.isInteger(expectedFloor) && Number.isInteger(savedFloor) && expectedFloor > savedFloor) {
-        return true;
-    }
-
     const savedText = job?.savedMessage?.mes ?? job?.resultText ?? '';
     return makeSaveGenerateMessageContentHash(savedText, savedFloor) === expectedHash;
+}
+
+function isSaveGenerateClientTailAlreadyHasJob(job, lastMessageInfo = {}) {
+    const savedFloor = Number.isInteger(job?.savedMessageFloor) ? job.savedMessageFloor : -1;
+    const lastFloor = normalizeSaveGenerateMessageFloor(lastMessageInfo?.floor);
+    const lastRole = normalizeSaveGenerateMessageRole(lastMessageInfo?.role);
+    return savedFloor >= 0 && lastFloor >= savedFloor && lastRole === 'assistant';
+}
+
+function normalizeSaveGenerateMessageFloor(value) {
+    if (Number.isInteger(value)) {
+        return value >= 0 ? value : -1;
+    }
+
+    const text = String(value ?? '').trim();
+    if (!/^\d+$/.test(text)) {
+        return -1;
+    }
+
+    const floor = Number(text);
+    return Number.isSafeInteger(floor) && floor >= 0 ? floor : -1;
+}
+
+function normalizeSaveGenerateMessageRole(value) {
+    const role = String(value ?? '').trim().toLowerCase();
+    return role === 'assistant' || role === 'user' ? role : '';
 }
 
 function normalizeSaveGenerateComparableText(value) {
@@ -1676,16 +1708,6 @@ function isSaveGenerateTextIncludedInMessage(messageText, jobText) {
     const normalizedMessage = normalizeSaveGenerateComparableText(messageText);
     const normalizedJobText = normalizeSaveGenerateComparableText(jobText);
     return Boolean(normalizedJobText && normalizedMessage.includes(normalizedJobText));
-}
-
-function parseSaveGenerateMessageHashFloor(value) {
-    const match = /^m(\d+):/.exec(String(value || ''));
-    if (!match) {
-        return null;
-    }
-
-    const floor = Number(match[1]);
-    return Number.isInteger(floor) && floor >= 0 ? floor : null;
 }
 
 function makeSaveGenerateMessageContentHash(value, floor) {
