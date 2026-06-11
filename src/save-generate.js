@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { Writable } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 import _ from 'lodash';
 import sanitize from 'sanitize-filename';
@@ -692,13 +693,14 @@ class CaptureResponse extends Writable {
 }
 
 function createStreamingState(chatCompletionSource) {
+    const decoder = new StringDecoder('utf8');
     let buffer = '';
     return {
         text: '',
         reasoning: '',
         push(chunk) {
             const clientChunks = [];
-            buffer += chunk.toString('utf8');
+            buffer += decoder.write(chunk);
 
             while (true) {
                 const match = /\r?\n\r?\n/.exec(buffer);
