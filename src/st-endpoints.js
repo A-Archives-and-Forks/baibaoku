@@ -2391,7 +2391,7 @@ async function getSettingsFastConfig(req, manager) {
         settingsAccelerationEnabled: value.settingsAccelerationEnabled !== false,
         characterListAccelerationEnabled: value.characterListAccelerationEnabled !== false,
         recentChatListAccelerationEnabled: value.recentChatListAccelerationEnabled !== false,
-        progressiveChatLoadingEnabled: value.progressiveChatLoadingEnabled === true,
+        progressiveChatLoadingEnabled: false,
         tokenizerBulkCountEnabled: value.tokenizerBulkCountEnabled !== false,
         extensionManifestBundleEnabled: value.extensionManifestBundleEnabled !== false,
     };
@@ -2410,9 +2410,7 @@ async function setSettingsFastConfig(req, manager) {
         recentChatListAccelerationEnabled: req.body?.recentChatListAccelerationEnabled === undefined
             ? current.recentChatListAccelerationEnabled !== false
             : req.body.recentChatListAccelerationEnabled !== false,
-        progressiveChatLoadingEnabled: req.body?.progressiveChatLoadingEnabled === undefined
-            ? current.progressiveChatLoadingEnabled === true
-            : req.body.progressiveChatLoadingEnabled === true,
+        progressiveChatLoadingEnabled: false,
         tokenizerBulkCountEnabled: req.body?.tokenizerBulkCountEnabled === undefined
             ? current.tokenizerBulkCountEnabled !== false
             : req.body.tokenizerBulkCountEnabled !== false,
@@ -3560,6 +3558,12 @@ export function registerStEndpoints(router, manager) {
     });
 
     router.post('/v1/chats/fast-get', async (req, res) => {
+        return res.status(410).json({
+            ok: false,
+            error: true,
+            message: 'Progressive chat loading is disabled',
+        });
+
         try {
             const result = await getFastChatGet(req);
 

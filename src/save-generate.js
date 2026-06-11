@@ -94,11 +94,11 @@ export function registerSaveGenerateEndpoints(router) {
         }
     });
 
-    router.get('/v1/chats/save-generate/pending', (req, res) => {
+    router.get('/v1/chats/save-generate/pending', async (req, res) => {
         try {
             res.json({
                 ok: true,
-                data: findSaveGenerateJobForChat(
+                data: await findSaveGenerateJobForChat(
                     req,
                     req.query?.chatId || req.query?.chat_id,
                     req.query?.lastMessageHash || req.query?.last_message_hash,
@@ -1226,7 +1226,7 @@ function findSaveGenerateJobToCancel(userHandle, jobId, chatId = '') {
     return latest;
 }
 
-function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '') {
+async function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '') {
     cleanupSaveGenerateJobs();
 
     const userHandle = req.user?.profile?.handle;
@@ -1277,7 +1277,29 @@ function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '') {
         return null;
     }
 
+    if (isSaveGenerateSavedStatus(latestTerminal.status)
+        && await isSaveGenerateJobAlreadyAtChatTail(latestTerminal)) {
+        return null;
+    }
+
     return serializeSaveGenerateJob(latestTerminal);
+}
+
+async function isSaveGenerateJobAlreadyAtChatTail(job) {
+    const filePath = job?.descriptor?.filePath;
+    const expectedText = String(job?.savedMessage?.mes ?? job?.resultText ?? '');
+    if (!filePath || !expectedText) {
+        return false;
+    }
+
+    try {
+        const chat = await readJsonlChat(filePath);
+        const lastMessage = getLastChatMessageInfo(chat).message;
+        return Boolean(lastMessage && lastMessage.is_user !== true && String(lastMessage.mes ?? '') === expectedText);
+    } catch (error) {
+        console.debug('[baibaoku] Could not verify save-generate chat tail:', error);
+        return false;
+    }
 }
 
 function serializeSaveGenerateJob(job) {
