@@ -333,6 +333,7 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
                     reasoning: streamState.reasoning,
                 });
 
+                writeStreamChunksToClient(streamResponse, clientOpen, streamState.takeDoneChunks());
                 endStreamResponse(streamResponse, clientOpen);
                 return { job, response };
             }
@@ -359,6 +360,9 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
             reasoning: String(result.reasoning || ''),
         });
 
+        if (job.generate.stream === true) {
+            writeStreamChunksToClient(streamResponse, clientOpen, streamState.takeDoneChunks());
+        }
         endStreamResponse(streamResponse, clientOpen);
         return { job, response };
     } catch (error) {
@@ -374,6 +378,7 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
                 reasoning: streamState.reasoning,
             });
 
+            writeStreamChunksToClient(streamResponse, clientOpen, streamState.takeDoneChunks());
             endStreamResponse(streamResponse, clientOpen);
             return { job, response };
         }
@@ -454,6 +459,16 @@ function sendStreamErrorResponse(streamResponse, error, clientOpen) {
 function endStreamResponse(streamResponse, clientOpen) {
     if (clientOpen && streamResponse && !streamResponse.writableEnded) {
         streamResponse.end();
+    }
+}
+
+function writeStreamChunksToClient(streamResponse, clientOpen, chunks) {
+    if (!clientOpen || !streamResponse || streamResponse.writableEnded || !Array.isArray(chunks)) {
+        return;
+    }
+
+    for (const chunk of chunks) {
+        streamResponse.write(chunk);
     }
 }
 
@@ -695,6 +710,7 @@ class CaptureResponse extends Writable {
 function createStreamingState(chatCompletionSource) {
     const decoder = new StringDecoder('utf8');
     let buffer = '';
+    const doneChunks = [];
     return {
         text: '',
         reasoning: '',
@@ -723,7 +739,7 @@ function createStreamingState(chatCompletionSource) {
 
                 const data = dataLines.join('\n');
                 if (data === '[DONE]') {
-                    clientChunks.push(Buffer.from(`${eventText}${eventDelimiter}`, 'utf8'));
+                    doneChunks.push(Buffer.from(`${eventText}${eventDelimiter}`, 'utf8'));
                     continue;
                 }
 
@@ -742,6 +758,9 @@ function createStreamingState(chatCompletionSource) {
             }
 
             return clientChunks;
+        },
+        takeDoneChunks() {
+            return doneChunks.splice(0, doneChunks.length);
         },
     };
 }
