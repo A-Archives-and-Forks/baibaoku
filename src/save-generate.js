@@ -17,6 +17,8 @@ const SAVE_GENERATE_DEFAULT_ERROR_STATUS = 500;
 const SAVE_GENERATE_PERSIST_VERSION = 1;
 const SAVE_GENERATE_DATABASE = 'baibaoku.internal';
 const SAVE_GENERATE_LEGACY_PERSIST_DIRECTORY = 'save-generate-jobs';
+const SAVE_GENERATE_EVENT_HEARTBEAT_MS = 15_000;
+const SAVE_GENERATE_EVENT_UPDATE_MIN_MS = 250;
 
 const saveGenerateJobs = new Map();
 const saveGenerateDbConnections = new Map();
@@ -100,6 +102,18 @@ export function registerSaveGenerateEndpoints(router) {
             });
         } catch (error) {
             res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
+        }
+    });
+
+    router.get('/v1/chats/save-generate/:jobId/events', async (req, res) => {
+        try {
+            await streamSaveGenerateJobEventsForRequest(req, res, req.params?.jobId);
+        } catch (error) {
+            if (!res.headersSent && !res.writableEnded) {
+                res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
+            } else if (!res.writableEnded) {
+                res.end();
+            }
         }
     });
 
@@ -189,6 +203,7 @@ function createSaveGenerateJob(req) {
         persistenceVersion: SAVE_GENERATE_PERSIST_VERSION,
         generateRequestSocket: null,
         captureResponse: null,
+        events: new EventEmitter(),
     };
 
     saveGenerateJobs.set(id, job);
@@ -1320,7 +1335,7 @@ async function migrateLegacyPersistedSaveGenerateJobs(req, db, userRoot) {
     }
 }
 
-async function getSaveGenerateJobForRequest(req, jobId) {
+async function getSaveGenerateRawJobForRequest(req, jobId) {
     cleanupSaveGenerateJobs();
 
     const userHandle = req.user?.profile?.handle;
@@ -1342,7 +1357,123 @@ async function getSaveGenerateJobForRequest(req, jobId) {
         throwHttpError('save-generate job was not found', 404);
     }
 
+    return job;
+}
+
+async function getSaveGenerateJobForRequest(req, jobId) {
+    const job = await getSaveGenerateRawJobForRequest(req, jobId);
     return serializeSaveGenerateJob(job);
+}
+
+async function streamSaveGenerateJobEventsForRequest(req, res, jobId) {
+    const job = await getSaveGenerateRawJobForRequest(req, jobId);
+    res.status(200);
+    res.set({
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    });
+    if (typeof res.flushHeaders === 'function') {
+        res.flushHeaders();
+    }
+
+    let closed = false;
+    let pendingTimer = null;
+    let lastSentAt = 0;
+
+    const writeEvent = (event, data = null) => {
+        if (closed || res.writableEnded) {
+            return false;
+        }
+
+        res.write(`event: ${event}\n`);
+        if (data !== null && data !== undefined) {
+            res.write(`data: ${JSON.stringify(data)}\n`);
+        }
+        res.write('\n');
+        if (typeof res.flush === 'function') {
+            res.flush();
+        }
+        lastSentAt = Date.now();
+        return true;
+    };
+
+    const close = () => {
+        if (closed) {
+            return;
+        }
+
+        closed = true;
+        if (pendingTimer) {
+            clearTimeout(pendingTimer);
+            pendingTimer = null;
+        }
+        job.events?.off?.('update', handleUpdate);
+        if (!res.writableEnded) {
+            res.end();
+        }
+    };
+
+    const sendSnapshot = (event = 'snapshot') => {
+        if (!writeEvent(event, serializeSaveGenerateJob(job))) {
+            return;
+        }
+
+        if (isSaveGenerateTerminalStatus(job.status)) {
+            close();
+        }
+    };
+
+    const handleUpdate = () => {
+        if (isSaveGenerateTerminalStatus(job.status)) {
+            if (pendingTimer) {
+                clearTimeout(pendingTimer);
+                pendingTimer = null;
+            }
+            sendSnapshot('done');
+            return;
+        }
+
+        const elapsed = Date.now() - lastSentAt;
+        if (elapsed >= SAVE_GENERATE_EVENT_UPDATE_MIN_MS) {
+            sendSnapshot('snapshot');
+            return;
+        }
+
+        if (!pendingTimer) {
+            pendingTimer = setTimeout(() => {
+                pendingTimer = null;
+                sendSnapshot('snapshot');
+            }, SAVE_GENERATE_EVENT_UPDATE_MIN_MS - elapsed);
+        }
+    };
+
+    if (!isSaveGenerateTerminalStatus(job.status)) {
+        getSaveGenerateJobEmitter(job).on('update', handleUpdate);
+    }
+
+    res.on('close', close);
+    writeEvent('hello', { id: job.id });
+    sendSnapshot(isSaveGenerateTerminalStatus(job.status) ? 'done' : 'snapshot');
+
+    if (isSaveGenerateTerminalStatus(job.status)) {
+        return;
+    }
+
+    const heartbeat = setInterval(() => {
+        if (isSaveGenerateTerminalStatus(job.status)) {
+            sendSnapshot('done');
+            clearInterval(heartbeat);
+            return;
+        }
+
+        if (!writeEvent('ping', { updatedAt: job.updatedAt })) {
+            clearInterval(heartbeat);
+        }
+    }, SAVE_GENERATE_EVENT_HEARTBEAT_MS);
+
+    res.on('close', () => clearInterval(heartbeat));
 }
 
 async function cancelSaveGenerateJobForRequest(req, jobId, chatId = '') {
@@ -1528,6 +1659,19 @@ function serializeSaveGenerateJob(job) {
 
 function touchSaveGenerateJob(job, patch) {
     Object.assign(job, patch, { updatedAt: Date.now() });
+    emitSaveGenerateJobUpdate(job);
+}
+
+function getSaveGenerateJobEmitter(job) {
+    if (!job.events) {
+        job.events = new EventEmitter();
+    }
+    job.events.setMaxListeners(0);
+    return job.events;
+}
+
+function emitSaveGenerateJobUpdate(job) {
+    job?.events?.emit?.('update', job);
 }
 
 async function failSaveGenerateJob(job, error) {
