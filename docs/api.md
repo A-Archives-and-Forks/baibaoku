@@ -92,7 +92,7 @@ GET /api/plugins/baibaoku/v1/status
     "installed": true,
     "id": "baibaoku",
     "name": "柏宝库",
-    "version": "0.4.1",
+    "version": "0.4.2",
     "apiVersion": "v1",
     "storage": "per-user",
     "user": "default-user",
@@ -462,6 +462,7 @@ and `mes` content.
 
 Terminal statuses:
 ```text
+completed
 saved
 already_saved
 conflict
@@ -469,6 +470,11 @@ failed
 canceled
 ```
 
+`completed` means the generation result was persisted by BaiBaoKu in the per-user
+SQLite database but was not written to the chat file. The frontend should let
+SillyTavern perform its normal chat save when the page is still online, or
+recover the persisted result after a reconnect.
+
 Cancel accepts either `jobId` or `chatId` in the request body. If cancellation
 happens during generation, already streamed partial text is discarded and is not
-saved to the chat file.
+persisted as a successful result.

@@ -5,33 +5,22 @@ import { EventEmitter } from 'node:events';
 import { Writable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 
-import _ from 'lodash';
-import sanitize from 'sanitize-filename';
-import { sync as writeFileAtomicSync } from 'write-file-atomic';
-
 import { router as chatCompletionsRouter } from '../../../src/endpoints/backends/chat-completions.js';
-import * as chatsEndpoint from '../../../src/endpoints/chats.js';
 import { CHAT_COMPLETION_SOURCES } from '../../../src/constants.js';
-import {
-    generateTimestamp,
-    getConfigValue,
-    removeOldBackups,
-    tryParse,
-} from '../../../src/util.js';
+import { tryParse } from '../../../src/util.js';
+import { loadSqliteDriver } from './database.js';
+import { getStoragePaths } from './paths.js';
 
-const SAVE_GENERATE_JOB_TTL_MS = 30 * 60 * 1000;
+const SAVE_GENERATE_JOB_TTL_MS = 2 * 24 * 60 * 60 * 1000;
 const SAVE_GENERATE_MAX_JOBS = 200;
 const SAVE_GENERATE_DEFAULT_ERROR_STATUS = 500;
-const SAVE_GENERATE_CHAT_BACKUPS_PREFIX = 'chat_';
-
-const saveGenerateChatBackupsEnabled = !!getConfigValue('backups.chat.enabled', true, 'boolean');
-const saveGenerateChatBackupLimit = Number(getConfigValue('backups.chat.maxTotalBackups', -1, 'number'));
-const saveGenerateChatBackupThrottleInterval = Number(getConfigValue('backups.chat.throttleInterval', 10_000, 'number'));
-const saveGenerateChatIntegrityCheck = !!getConfigValue('backups.chat.checkIntegrity', true, 'boolean');
+const SAVE_GENERATE_PERSIST_VERSION = 1;
+const SAVE_GENERATE_DATABASE = 'baibaoku.internal';
+const SAVE_GENERATE_LEGACY_PERSIST_DIRECTORY = 'save-generate-jobs';
 
 const saveGenerateJobs = new Map();
-const saveGenerateLocks = new Map();
-const saveGenerateBackupFunctions = new Map();
+const saveGenerateDbConnections = new Map();
+const saveGenerateLegacyMigrationUsers = new Set();
 
 export function registerSaveGenerateEndpoints(router) {
     router.post('/v1/chats/save-generate', async (req, res) => {
@@ -58,22 +47,22 @@ export function registerSaveGenerateEndpoints(router) {
         }
     });
 
-    router.post('/v1/chats/save-generate/status', (req, res) => {
+    router.post('/v1/chats/save-generate/status', async (req, res) => {
         try {
             res.json({
                 ok: true,
-                data: getSaveGenerateJobForRequest(req, req.body?.jobId || req.body?.id),
+                data: await getSaveGenerateJobForRequest(req, req.body?.jobId || req.body?.id),
             });
         } catch (error) {
             res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
         }
     });
 
-    router.post('/v1/chats/save-generate/cancel', (req, res) => {
+    router.post('/v1/chats/save-generate/cancel', async (req, res) => {
         try {
             res.json({
                 ok: true,
-                data: cancelSaveGenerateJobForRequest(
+                data: await cancelSaveGenerateJobForRequest(
                     req,
                     req.body?.jobId || req.body?.id,
                     req.body?.chatId || req.body?.chat_id,
@@ -84,11 +73,11 @@ export function registerSaveGenerateEndpoints(router) {
         }
     });
 
-    router.post('/v1/chats/save-generate/:jobId/cancel', (req, res) => {
+    router.post('/v1/chats/save-generate/:jobId/cancel', async (req, res) => {
         try {
             res.json({
                 ok: true,
-                data: cancelSaveGenerateJobForRequest(req, req.params?.jobId),
+                data: await cancelSaveGenerateJobForRequest(req, req.params?.jobId),
             });
         } catch (error) {
             res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
@@ -110,11 +99,11 @@ export function registerSaveGenerateEndpoints(router) {
         }
     });
 
-    router.get('/v1/chats/save-generate/:jobId', (req, res) => {
+    router.get('/v1/chats/save-generate/:jobId', async (req, res) => {
         try {
             res.json({
                 ok: true,
-                data: getSaveGenerateJobForRequest(req, req.params?.jobId),
+                data: await getSaveGenerateJobForRequest(req, req.params?.jobId),
             });
         } catch (error) {
             res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
@@ -124,7 +113,16 @@ export function registerSaveGenerateEndpoints(router) {
 
 export function closeSaveGenerateJobs() {
     saveGenerateJobs.clear();
-    saveGenerateLocks.clear();
+    saveGenerateLegacyMigrationUsers.clear();
+    for (const db of saveGenerateDbConnections.values()) {
+        try {
+            db.pragma('wal_checkpoint(TRUNCATE)');
+            db.close();
+        } catch {
+            // Ignore close errors during server shutdown.
+        }
+    }
+    saveGenerateDbConnections.clear();
 }
 
 function createSaveGenerateJob(req) {
@@ -160,6 +158,8 @@ function createSaveGenerateJob(req) {
         generateStartedAt: null,
         generateFinishedAt: null,
         savedAt: null,
+        persistedAt: null,
+        chatSaved: false,
         error: null,
         resultText: '',
         reasoning: '',
@@ -182,6 +182,7 @@ function createSaveGenerateJob(req) {
         savedMessageFloor: null,
         conflict: null,
         alreadySaved: false,
+        persistenceVersion: SAVE_GENERATE_PERSIST_VERSION,
         generateRequestSocket: null,
         captureResponse: null,
     };
@@ -224,7 +225,6 @@ function resolveSaveGenerateChatFile(req, save) {
     if (!chatsRoot) {
         throwHttpError('User chats directory is unavailable', 500);
     }
-
     const avatarUrl = String(save.avatar_url || '');
     const fileName = String(save.file_name || '');
     const characterName = String(save.ch_name || save.char_name || save.name || '');
@@ -254,6 +254,15 @@ function resolveSaveGenerateChatFile(req, save) {
         handle: req.user?.profile?.handle,
         requestUser: req.user,
     };
+}
+
+function getSaveGenerateLegacyPersistDirectory(userRoot) {
+    const root = path.resolve(userRoot);
+    const directory = path.resolve(root, 'baibaoku', SAVE_GENERATE_LEGACY_PERSIST_DIRECTORY);
+    if (!isPathUnderParent(root, directory)) {
+        throwHttpError('Resolved legacy save-generate persist path is outside user directory', 400);
+    }
+    return directory;
 }
 
 async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
@@ -367,7 +376,7 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
         return { job, response };
     } catch (error) {
         if (isSaveGenerateCancelError(error) || job.cancelRequested) {
-            cancelSaveGenerateJob(job);
+            await cancelSaveGenerateJob(job);
             endStreamResponse(streamResponse, clientOpen);
             return { job, response };
         }
@@ -383,7 +392,7 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
             return { job, response };
         }
 
-        failSaveGenerateJob(job, error);
+        await failSaveGenerateJob(job, error);
         sendStreamErrorResponse(streamResponse, error, clientOpen);
         throw error;
     }
@@ -391,15 +400,15 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
 
 async function finishGeneratedResult(job, result) {
     touchSaveGenerateJob(job, {
-        status: 'saving',
+        status: 'persisting',
         resultText: String(result.text || ''),
         reasoning: String(result.reasoning || ''),
     });
 
     try {
-        await saveGeneratedMessage(job);
+        await persistGeneratedResult(job);
     } catch (error) {
-        failSaveGenerateJob(job, error);
+        await failSaveGenerateJob(job, error);
     }
 }
 
@@ -843,186 +852,34 @@ function extractNonStreamingResult(bodyText, chatCompletionSource) {
     };
 }
 
-async function saveGeneratedMessage(job) {
-    const key = `${job.userHandle}:${job.descriptor.filePath}`;
-    const previous = saveGenerateLocks.get(key) || Promise.resolve();
-    const next = previous
-        .catch(() => undefined)
-        .then(() => saveGeneratedMessageLocked(job))
-        .finally(() => {
-            if (saveGenerateLocks.get(key) === next) {
-                saveGenerateLocks.delete(key);
-            }
-        });
-
-    saveGenerateLocks.set(key, next);
-    return next;
-}
-
-async function saveGeneratedMessageLocked(job) {
-    await fs.promises.mkdir(job.descriptor.directoryPath, { recursive: true });
-    const chat = await readJsonlChat(job.descriptor.filePath);
-    const currentVersion = await getChatVersion(job.descriptor.filePath);
-    const expectedVersion = job.save.expectedVersion;
-    const existingLastMessageInfo = getLastChatMessageInfo(chat);
-    const existingLastMessage = existingLastMessageInfo.message;
-    const generationType = getSaveGenerateType(job.save, job.generate);
-
-    if (isSameGeneratedMessage(existingLastMessage, job)) {
-        touchSaveGenerateJob(job, {
-            status: 'already_saved',
-            alreadySaved: true,
-            savedMessage: existingLastMessage,
-            savedMessageFloor: existingLastMessageInfo.floor,
-            savedAt: Date.now(),
-            finishedAt: Date.now(),
-        });
-        return;
-    }
-
-    if (expectedVersion && currentVersion !== expectedVersion) {
-        touchSaveGenerateJob(job, {
-            status: 'conflict',
-            conflict: {
-                expectedVersion,
-                currentVersion,
-            },
-            finishedAt: Date.now(),
-        });
-        return;
-    }
-
+async function persistGeneratedResult(job) {
     const now = Date.now();
     const message = makeAssistantMessage(job, now);
-    const baseChat = generationType === 'regenerate'
-        ? removeLastRegeneratedMessage(chat)
-        : chat;
-    const savedMessageFloor = countSaveGenerateChatMessages(baseChat);
-    const nextChat = appendChatMessage(baseChat, message);
-    const preWriteVersion = await getChatVersion(job.descriptor.filePath);
-
-    if (preWriteVersion !== currentVersion) {
-        touchSaveGenerateJob(job, {
-            status: 'conflict',
-            conflict: {
-                expectedVersion: currentVersion,
-                currentVersion: preWriteVersion,
-            },
-            finishedAt: Date.now(),
-        });
-        return;
-    }
-
-    await saveChatCompat(
-        nextChat,
-        job.descriptor.filePath,
-        false,
-        job.descriptor.handle,
-        job.descriptor.backupName,
-        job.descriptor.backupDirectory,
-    );
+    const savedMessageFloor = await estimateGeneratedMessageFloor(job);
 
     touchSaveGenerateJob(job, {
-        status: 'saved',
+        status: 'completed',
         savedMessage: message,
         savedMessageFloor,
-        savedAt: Date.now(),
-        finishedAt: Date.now(),
+        savedAt: null,
+        persistedAt: now,
+        chatSaved: false,
+        finishedAt: now,
     });
+    await persistSaveGenerateJob(job, { required: true });
 }
 
-async function saveChatCompat(chatData, filePath, skipIntegrityCheck = false, handle, cardName, backupDirectory) {
-    if (typeof chatsEndpoint.trySaveChat === 'function') {
-        return chatsEndpoint.trySaveChat(chatData, filePath, skipIntegrityCheck, handle, cardName, backupDirectory);
-    }
-
-    const jsonlData = chatData?.map(message => JSON.stringify(message)).join('\n');
-    const doIntegrityCheck = saveGenerateChatIntegrityCheck && !skipIntegrityCheck;
-    const chatIntegritySlug = doIntegrityCheck ? chatData?.[0]?.chat_metadata?.integrity : undefined;
-
-    if (chatIntegritySlug && !await checkChatIntegrityCompat(filePath, chatIntegritySlug)) {
-        const error = new Error(`Chat integrity check failed for "${filePath}". The expected integrity slug was "${chatIntegritySlug}".`);
-        error.code = 'BAIBAOKU_CHAT_INTEGRITY';
-        throw error;
-    }
-
-    writeFileAtomicSync(filePath, jsonlData, 'utf8');
-    getSaveGenerateBackupFunction(handle)(backupDirectory, cardName, jsonlData);
-}
-
-async function checkChatIntegrityCompat(filePath, integritySlug) {
-    if (!fs.existsSync(filePath)) {
-        return true;
-    }
-
-    const firstLine = await readFirstLineCompat(filePath);
-    const jsonData = tryParse(firstLine);
-    const chatIntegrity = jsonData?.chat_metadata?.integrity;
-
-    if (!chatIntegrity) {
-        return true;
-    }
-
-    return chatIntegrity === integritySlug;
-}
-
-async function readFirstLineCompat(filePath) {
-    const handle = await fs.promises.open(filePath, 'r');
+async function estimateGeneratedMessageFloor(job) {
     try {
-        const buffer = Buffer.alloc(4096);
-        let line = '';
-        let position = 0;
-
-        while (true) {
-            const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
-            if (!bytesRead) {
-                return line;
-            }
-
-            const chunk = buffer.subarray(0, bytesRead).toString('utf8');
-            const newlineIndex = chunk.indexOf('\n');
-            if (newlineIndex !== -1) {
-                return line + chunk.slice(0, newlineIndex);
-            }
-
-            line += chunk;
-            position += bytesRead;
-        }
-    } finally {
-        await handle.close();
-    }
-}
-
-function getSaveGenerateBackupFunction(handle) {
-    const key = handle || 'default';
-    if (!saveGenerateBackupFunctions.has(key)) {
-        saveGenerateBackupFunctions.set(key, _.throttle(backupChatCompat, saveGenerateChatBackupThrottleInterval, {
-            leading: true,
-            trailing: true,
-        }));
-    }
-
-    return saveGenerateBackupFunctions.get(key) || (() => { });
-}
-
-function backupChatCompat(directory, name, chat) {
-    try {
-        if (!saveGenerateChatBackupsEnabled || !directory || !fs.existsSync(directory)) {
-            return;
-        }
-
-        const safeName = sanitize(String(name || 'chat')).replace(/[^a-z0-9]/gi, '_').toLowerCase();
-        const backupFile = path.join(directory, `${SAVE_GENERATE_CHAT_BACKUPS_PREFIX}${safeName}_${generateTimestamp()}.jsonl`);
-        writeFileAtomicSync(backupFile, chat, 'utf8');
-        removeOldBackups(directory, `${SAVE_GENERATE_CHAT_BACKUPS_PREFIX}${safeName}_`);
-
-        if (isNaN(saveGenerateChatBackupLimit) || saveGenerateChatBackupLimit < 0) {
-            return;
-        }
-
-        removeOldBackups(directory, SAVE_GENERATE_CHAT_BACKUPS_PREFIX, saveGenerateChatBackupLimit);
+        const chat = await readJsonlChat(job.descriptor.filePath);
+        const generationType = getSaveGenerateType(job.save, job.generate);
+        const baseChat = generationType === 'regenerate'
+            ? removeLastRegeneratedMessage(chat)
+            : chat;
+        return countSaveGenerateChatMessages(baseChat);
     } catch (error) {
-        console.error(`[baibaoku] Could not backup chat for ${name}`, error);
+        console.debug('[baibaoku] Could not estimate save-generate message floor:', error);
+        return -1;
     }
 }
 
@@ -1058,26 +915,6 @@ function makeAssistantMessage(job, timestamp) {
     return message;
 }
 
-function appendChatMessage(chat, message) {
-    if (!Array.isArray(chat) || chat.length === 0) {
-        return [{
-            chat_metadata: {},
-            user_name: 'unused',
-            character_name: 'unused',
-        }, message];
-    }
-
-    if (chat[0]?.chat_metadata && typeof chat[0].chat_metadata === 'object') {
-        return [...chat, message];
-    }
-
-    return [{
-        chat_metadata: {},
-        user_name: 'unused',
-        character_name: 'unused',
-    }, ...chat, message];
-}
-
 function removeLastRegeneratedMessage(chat) {
     if (!Array.isArray(chat) || chat.length === 0) {
         return chat;
@@ -1097,16 +934,6 @@ function removeLastRegeneratedMessage(chat) {
     }
 
     return nextChat;
-}
-
-function isSameGeneratedMessage(message, job) {
-    if (!message || message.is_user) {
-        return false;
-    }
-
-    return String(message.mes || '') === String(job.resultText || '')
-        && String(message.extra?.api || '') === String(job.generate.chat_completion_source || '')
-        && String(message.extra?.model || '') === String(job.generate.model || '');
 }
 
 function getLastChatMessageInfo(chat) {
@@ -1167,19 +994,329 @@ async function readJsonlChat(filePath) {
     }
 }
 
-async function getChatVersion(filePath) {
+async function persistSaveGenerateJob(job, { required = false } = {}) {
+    if (!job || !isSaveGenerateTerminalStatus(job.status)) {
+        return false;
+    }
+
     try {
-        const stats = await fs.promises.stat(filePath);
-        return `${stats.size}:${stats.mtimeMs}`;
+        const db = await getSaveGenerateDb(job.descriptor?.requestUser);
+        const payload = serializeSaveGenerateJobForPersistence(job);
+        const expiresAt = Number(job.updatedAt || Date.now()) + SAVE_GENERATE_JOB_TTL_MS;
+        db.prepare(`
+            INSERT INTO save_generate_jobs (
+                id,
+                user_handle,
+                chat_id,
+                status,
+                created_at,
+                updated_at,
+                finished_at,
+                expires_at,
+                payload
+            )
+            VALUES (@id, @userHandle, @chatId, @status, @createdAt, @updatedAt, @finishedAt, @expiresAt, @payload)
+            ON CONFLICT(id) DO UPDATE SET
+                user_handle = excluded.user_handle,
+                chat_id = excluded.chat_id,
+                status = excluded.status,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                finished_at = excluded.finished_at,
+                expires_at = excluded.expires_at,
+                payload = excluded.payload
+        `).run({
+            id: job.id,
+            userHandle: job.userHandle,
+            chatId: normalizeChatId(job.save?.chatId || job.save?.file_name),
+            status: job.status,
+            createdAt: Number(job.createdAt || Date.now()),
+            updatedAt: Number(job.updatedAt || Date.now()),
+            finishedAt: job.finishedAt || null,
+            expiresAt,
+            payload: JSON.stringify(payload),
+        });
+        return true;
     } catch (error) {
-        if (error?.code === 'ENOENT') {
-            return '0:0';
+        if (required) {
+            throw error;
         }
-        throw error;
+        console.warn('[baibaoku] Failed to persist save-generate job:', error.message);
+        return false;
     }
 }
 
-function getSaveGenerateJobForRequest(req, jobId) {
+async function getSaveGenerateDb(reqOrUser) {
+    const req = reqOrUser?.directories ? { user: reqOrUser } : reqOrUser;
+    const userRoot = req?.user?.directories?.root;
+    if (!userRoot) {
+        throwHttpError('User data directory is unavailable', 500);
+    }
+
+    const paths = getStoragePaths(req, SAVE_GENERATE_DATABASE);
+    const databasePath = path.resolve(paths.databasePath);
+    if (saveGenerateDbConnections.has(databasePath)) {
+        return saveGenerateDbConnections.get(databasePath);
+    }
+
+    const driver = await loadSqliteDriver();
+    const db = driver.open(databasePath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('wal_autocheckpoint = 512');
+    db.pragma('journal_size_limit = 67108864');
+    db.pragma('busy_timeout = 5000');
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS save_generate_jobs (
+            id TEXT PRIMARY KEY,
+            user_handle TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            expires_at INTEGER NOT NULL,
+            payload TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_save_generate_jobs_user_chat_updated
+            ON save_generate_jobs(user_handle, chat_id, updated_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_save_generate_jobs_expires
+            ON save_generate_jobs(expires_at);
+    `);
+    saveGenerateDbConnections.set(databasePath, db);
+    return db;
+}
+
+function serializeSaveGenerateJobForPersistence(job) {
+    return {
+        id: job.id,
+        userHandle: job.userHandle,
+        status: job.status,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        startedAt: job.startedAt,
+        finishedAt: job.finishedAt,
+        generateStartedAt: job.generateStartedAt,
+        generateFinishedAt: job.generateFinishedAt,
+        savedAt: job.savedAt,
+        persistedAt: job.persistedAt,
+        chatSaved: job.chatSaved === true,
+        responseStatus: job.responseStatus,
+        responseStatusText: job.responseStatusText,
+        cancelRequested: job.cancelRequested === true,
+        canceledAt: job.canceledAt,
+        save: job.save,
+        generate: job.generate,
+        resultText: job.resultText,
+        reasoning: job.reasoning,
+        savedMessage: job.savedMessage,
+        savedMessageFloor: job.savedMessageFloor,
+        conflict: job.conflict,
+        alreadySaved: job.alreadySaved === true,
+        error: job.error,
+        persistenceVersion: SAVE_GENERATE_PERSIST_VERSION,
+    };
+}
+
+async function ensureSaveGeneratePersistenceReady(req) {
+    const userHandle = req.user?.profile?.handle;
+    if (!userHandle) {
+        throwHttpError('Unauthorized', 401);
+    }
+
+    const userRoot = req.user?.directories?.root;
+    if (!userRoot) {
+        throwHttpError('User data directory is unavailable', 500);
+    }
+
+    const db = await getSaveGenerateDb(req);
+    cleanupPersistedSaveGenerateJobs(db);
+    await migrateLegacyPersistedSaveGenerateJobs(req, db, userRoot);
+}
+
+function restorePersistedSaveGenerateJob(req, payload) {
+    const rawJob = payload?.job || payload;
+    const version = payload?.version || rawJob?.persistenceVersion;
+    if (version !== SAVE_GENERATE_PERSIST_VERSION || !rawJob || typeof rawJob !== 'object') {
+        return null;
+    }
+
+    if (!rawJob.id || !isSaveGenerateTerminalStatus(rawJob.status)) {
+        return null;
+    }
+
+    const userHandle = req.user?.profile?.handle;
+    if (rawJob.userHandle !== userHandle) {
+        return null;
+    }
+
+    if (Date.now() - Number(rawJob.updatedAt || rawJob.finishedAt || rawJob.createdAt || 0) > SAVE_GENERATE_JOB_TTL_MS) {
+        return null;
+    }
+
+    const save = rawJob.save && typeof rawJob.save === 'object' ? rawJob.save : null;
+    if (!save) {
+        return null;
+    }
+
+    const descriptor = resolveSaveGenerateChatFile(req, {
+        avatar_url: save.avatar_url,
+        file_name: save.file_name,
+        ch_name: save.ch_name,
+        chatId: save.chatId,
+    });
+
+    return {
+        id: String(rawJob.id),
+        userHandle,
+        status: String(rawJob.status),
+        createdAt: Number(rawJob.createdAt || Date.now()),
+        updatedAt: Number(rawJob.updatedAt || rawJob.finishedAt || rawJob.createdAt || Date.now()),
+        startedAt: rawJob.startedAt || null,
+        finishedAt: rawJob.finishedAt || null,
+        generateStartedAt: rawJob.generateStartedAt || null,
+        generateFinishedAt: rawJob.generateFinishedAt || null,
+        savedAt: rawJob.savedAt || null,
+        persistedAt: rawJob.persistedAt || null,
+        chatSaved: rawJob.chatSaved === true,
+        error: rawJob.error || null,
+        resultText: String(rawJob.resultText || ''),
+        reasoning: String(rawJob.reasoning || ''),
+        responseStatus: rawJob.responseStatus || null,
+        responseStatusText: rawJob.responseStatusText || '',
+        cancelRequested: rawJob.cancelRequested === true,
+        canceledAt: rawJob.canceledAt || null,
+        save: {
+            kind: save.kind || 'character',
+            type: String(save.type || 'normal'),
+            chatId: normalizeChatId(save.chatId || save.file_name),
+            avatar_url: String(save.avatar_url || ''),
+            file_name: String(save.file_name || ''),
+            ch_name: String(save.ch_name || ''),
+            expectedVersion: normalizeExpectedVersion(save.expectedVersion ?? save.expected_version),
+        },
+        descriptor,
+        generate: rawJob.generate && typeof rawJob.generate === 'object' ? rawJob.generate : {},
+        savedMessage: rawJob.savedMessage || null,
+        savedMessageFloor: Number.isInteger(rawJob.savedMessageFloor) ? rawJob.savedMessageFloor : -1,
+        conflict: rawJob.conflict || null,
+        alreadySaved: rawJob.alreadySaved === true,
+        persistenceVersion: SAVE_GENERATE_PERSIST_VERSION,
+        generateRequestSocket: null,
+        captureResponse: null,
+    };
+}
+
+function cleanupPersistedSaveGenerateJobs(db) {
+    db.prepare('DELETE FROM save_generate_jobs WHERE expires_at <= ?').run(Date.now());
+}
+
+async function getPersistedSaveGenerateJob(req, id) {
+    if (!id) {
+        return null;
+    }
+
+    const userHandle = req.user?.profile?.handle;
+    const db = await getSaveGenerateDb(req);
+    const row = db.prepare(`
+        SELECT payload
+        FROM save_generate_jobs
+        WHERE id = ? AND user_handle = ? AND expires_at > ?
+    `).get(id, userHandle, Date.now());
+
+    return row ? restorePersistedSaveGenerateJob(req, tryParse(row.payload)) : null;
+}
+
+async function findPersistedSaveGenerateJobForChat(req, chatId) {
+    const userHandle = req.user?.profile?.handle;
+    const normalizedChatId = normalizeChatId(chatId);
+    if (!userHandle || !normalizedChatId) {
+        return null;
+    }
+
+    const db = await getSaveGenerateDb(req);
+    const row = db.prepare(`
+        SELECT payload
+        FROM save_generate_jobs
+        WHERE user_handle = ?
+          AND chat_id = ?
+          AND expires_at > ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+    `).get(userHandle, normalizedChatId, Date.now());
+
+    return row ? restorePersistedSaveGenerateJob(req, tryParse(row.payload)) : null;
+}
+
+async function migrateLegacyPersistedSaveGenerateJobs(req, db, userRoot) {
+    const userHandle = req.user?.profile?.handle;
+    const directory = getSaveGenerateLegacyPersistDirectory(userRoot);
+    const migrationKey = `${userHandle}:${directory}`;
+    if (saveGenerateLegacyMigrationUsers.has(migrationKey)) {
+        return;
+    }
+
+    saveGenerateLegacyMigrationUsers.add(migrationKey);
+
+    let entries = [];
+    try {
+        entries = await fs.promises.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            return;
+        }
+        throw error;
+    }
+
+    for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) {
+            continue;
+        }
+
+        const filePath = path.join(directory, entry.name);
+        try {
+            const payload = tryParse(await fs.promises.readFile(filePath, 'utf8'));
+            const job = restorePersistedSaveGenerateJob(req, payload);
+            if (job) {
+                const dbPayload = serializeSaveGenerateJobForPersistence(job);
+                const expiresAt = Number(job.updatedAt || Date.now()) + SAVE_GENERATE_JOB_TTL_MS;
+                db.prepare(`
+                    INSERT INTO save_generate_jobs (
+                        id,
+                        user_handle,
+                        chat_id,
+                        status,
+                        created_at,
+                        updated_at,
+                        finished_at,
+                        expires_at,
+                        payload
+                    )
+                    VALUES (@id, @userHandle, @chatId, @status, @createdAt, @updatedAt, @finishedAt, @expiresAt, @payload)
+                    ON CONFLICT(id) DO NOTHING
+                `).run({
+                    id: job.id,
+                    userHandle: job.userHandle,
+                    chatId: normalizeChatId(job.save?.chatId || job.save?.file_name),
+                    status: job.status,
+                    createdAt: Number(job.createdAt || Date.now()),
+                    updatedAt: Number(job.updatedAt || Date.now()),
+                    finishedAt: job.finishedAt || null,
+                    expiresAt,
+                    payload: JSON.stringify(dbPayload),
+                });
+            }
+            await fs.promises.unlink(filePath);
+        } catch (error) {
+            if (error?.code !== 'ENOENT') {
+                console.warn(`[baibaoku] Failed to migrate legacy save-generate job ${entry.name}:`, error.message);
+            }
+        }
+    }
+}
+
+async function getSaveGenerateJobForRequest(req, jobId) {
     cleanupSaveGenerateJobs();
 
     const userHandle = req.user?.profile?.handle;
@@ -1188,7 +1325,15 @@ function getSaveGenerateJobForRequest(req, jobId) {
     }
 
     const id = String(jobId || '');
-    const job = saveGenerateJobs.get(id);
+    let job = saveGenerateJobs.get(id);
+    if (!job) {
+        try {
+            await ensureSaveGeneratePersistenceReady(req);
+            job = await getPersistedSaveGenerateJob(req, id);
+        } catch (error) {
+            console.debug('[baibaoku] Could not query persisted save-generate job:', error.message);
+        }
+    }
     if (!job || job.userHandle !== userHandle) {
         throwHttpError('save-generate job was not found', 404);
     }
@@ -1196,7 +1341,7 @@ function getSaveGenerateJobForRequest(req, jobId) {
     return serializeSaveGenerateJob(job);
 }
 
-function cancelSaveGenerateJobForRequest(req, jobId, chatId = '') {
+async function cancelSaveGenerateJobForRequest(req, jobId, chatId = '') {
     cleanupSaveGenerateJobs();
 
     const userHandle = req.user?.profile?.handle;
@@ -1209,7 +1354,7 @@ function cancelSaveGenerateJobForRequest(req, jobId, chatId = '') {
         throwHttpError('cancelable save-generate job was not found', 404);
     }
 
-    cancelSaveGenerateJob(job);
+    await cancelSaveGenerateJob(job);
     return serializeSaveGenerateJob(job);
 }
 
@@ -1289,6 +1434,16 @@ async function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '') {
         return serializeSaveGenerateJob(latestPending);
     }
 
+    try {
+        await ensureSaveGeneratePersistenceReady(req);
+        const persistedTerminal = await findPersistedSaveGenerateJobForChat(req, normalizedChatId);
+        if (persistedTerminal && (!latestTerminal || Number(persistedTerminal.updatedAt || 0) > Number(latestTerminal.updatedAt || 0))) {
+            latestTerminal = persistedTerminal;
+        }
+    } catch (error) {
+        console.debug('[baibaoku] Could not query persisted save-generate jobs:', error.message);
+    }
+
     if (!latestTerminal) {
         return null;
     }
@@ -1315,8 +1470,18 @@ async function isSaveGenerateJobAlreadyAtChatTail(job) {
 
     try {
         const chat = await readJsonlChat(filePath);
-        const lastMessage = getLastChatMessageInfo(chat).message;
-        return Boolean(lastMessage && lastMessage.is_user !== true && String(lastMessage.mes ?? '') === expectedText);
+        const lastMessageInfo = getLastChatMessageInfo(chat);
+        const savedFloor = Number.isInteger(job?.savedMessageFloor) ? job.savedMessageFloor : -1;
+        if (Number.isInteger(lastMessageInfo.floor) && Number.isInteger(savedFloor) && savedFloor >= 0 && lastMessageInfo.floor > savedFloor) {
+            return true;
+        }
+
+        const lastMessage = lastMessageInfo.message;
+        return Boolean(
+            lastMessage
+            && lastMessage.is_user !== true
+            && isSaveGenerateTextIncludedInMessage(lastMessage.mes, expectedText),
+        );
     } catch (error) {
         console.debug('[baibaoku] Could not verify save-generate chat tail:', error);
         return false;
@@ -1332,6 +1497,9 @@ function serializeSaveGenerateJob(job) {
         startedAt: job.startedAt,
         finishedAt: job.finishedAt,
         savedAt: job.savedAt,
+        persistedAt: job.persistedAt,
+        chatSaved: job.chatSaved === true,
+        persistenceVersion: job.persistenceVersion || SAVE_GENERATE_PERSIST_VERSION,
         responseStatus: job.responseStatus,
         responseStatusText: job.responseStatusText,
         cancelRequested: job.cancelRequested,
@@ -1351,7 +1519,7 @@ function touchSaveGenerateJob(job, patch) {
     Object.assign(job, patch, { updatedAt: Date.now() });
 }
 
-function failSaveGenerateJob(job, error) {
+async function failSaveGenerateJob(job, error) {
     touchSaveGenerateJob(job, {
         status: 'failed',
         finishedAt: Date.now(),
@@ -1360,9 +1528,10 @@ function failSaveGenerateJob(job, error) {
             status: error?.status || null,
         },
     });
+    await persistSaveGenerateJob(job);
 }
 
-function cancelSaveGenerateJob(job) {
+async function cancelSaveGenerateJob(job) {
     if (!job || !isSaveGenerateCancelableStatus(job.status)) {
         return;
     }
@@ -1386,6 +1555,7 @@ function cancelSaveGenerateJob(job) {
             status: 499,
         },
     });
+    await persistSaveGenerateJob(job);
 }
 
 function closeSaveGenerateJobSockets(job) {
@@ -1455,15 +1625,15 @@ function getSaveGenerateType(save, generate) {
 }
 
 function isSaveGenerateTerminalStatus(status) {
-    return ['saved', 'already_saved', 'conflict', 'failed', 'canceled'].includes(status);
+    return ['completed', 'saved', 'already_saved', 'conflict', 'failed', 'canceled'].includes(status);
 }
 
 function isSaveGenerateSavedStatus(status) {
-    return ['saved', 'already_saved'].includes(status);
+    return ['completed', 'saved', 'already_saved'].includes(status);
 }
 
 function isSaveGenerateCancelableStatus(status) {
-    return ['queued', 'running', 'streaming'].includes(status);
+    return ['queued', 'running', 'streaming', 'persisting'].includes(status);
 }
 
 function makeSaveGenerateCancelError() {
@@ -1491,6 +1661,21 @@ function isSaveGenerateLastMessageHashMatch(job, lastMessageHash) {
 
     const savedText = job?.savedMessage?.mes ?? job?.resultText ?? '';
     return makeSaveGenerateMessageContentHash(savedText, savedFloor) === expectedHash;
+}
+
+function normalizeSaveGenerateComparableText(value) {
+    return String(value ?? '')
+        .replace(/^\uFEFF/, '')
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n')
+        .replace(/\n?data:\s*\[DONE\]\s*$/i, '')
+        .trim();
+}
+
+function isSaveGenerateTextIncludedInMessage(messageText, jobText) {
+    const normalizedMessage = normalizeSaveGenerateComparableText(messageText);
+    const normalizedJobText = normalizeSaveGenerateComparableText(jobText);
+    return Boolean(normalizedJobText && normalizedMessage.includes(normalizedJobText));
 }
 
 function parseSaveGenerateMessageHashFloor(value) {

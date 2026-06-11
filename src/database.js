@@ -445,7 +445,7 @@ export class DatabaseManager {
     }
 }
 
-async function loadSqliteDriver() {
+export async function loadSqliteDriver() {
     if (sqliteDriver) {
         return sqliteDriver;
     }
