@@ -69,7 +69,7 @@ const settingsBackupSchedulers = new Map();
 const lastBackupTexts = new Map();
 const tokenizerLoadPromises = new WeakMap();
 let staticSettingsPayload = null;
-const EARLY_BRIDGE_VERSION = '0.5';
+const EARLY_BRIDGE_VERSION = '0.6';
 
 /**
  * Normalizes tags from V1/V2 char data structure.
