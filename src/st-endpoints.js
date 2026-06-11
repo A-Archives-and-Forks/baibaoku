@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import bytes from 'bytes';
+import sanitize from 'sanitize-filename';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { parse } from '../../../src/character-card-parser.js';
 import { PUBLIC_DIRECTORIES, SETTINGS_FILE } from '../../../src/constants.js';
@@ -38,11 +39,15 @@ const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
 const FAST_CHAT_GET_DEFAULT_INITIAL_MESSAGES = 5;
 const SETTINGS_TEXT_PERSIST_VERSION = 1;
 const SETTINGS_TEXT_PERSIST_FILE = 'settings-text-v1.json';
-const SETTINGS_PAYLOAD_PERSIST_VERSION = 1;
+const SETTINGS_PAYLOAD_PERSIST_VERSION = 2;
 const SETTINGS_PAYLOAD_PERSIST_FILE = 'settings-payload-v1.json';
 const SETTINGS_RESPONSE_PERSIST_VERSION = 1;
 const SETTINGS_RESPONSE_META_FILE = 'settings-response-v1.json';
 const SETTINGS_RESPONSE_BODY_FILE = 'settings-response-v1.body';
+const SETTINGS_THEME_MODE_FULL = 'full';
+const SETTINGS_THEME_MODE_LAZY = 'lazy';
+const SETTINGS_LAZY_THEME_MARKER = '__baibaokuLazyTheme';
+const SETTINGS_THEME_INDEX_CACHE_VERSION = 1;
 
 // Cache structure: Map<userHandle, Map<filename, { mtime: number, size: number, data: Object }>>
 const userCaches = new Map();
@@ -52,7 +57,7 @@ const updateLocks = new Map();
 const settingsUserCaches = new Map();
 // Lock structure: Map<userHandle, Promise<Object>>
 const settingsUpdateLocks = new Map();
-// Cache structure: Map<userHandle, { path: string, text: string, mtime: number, size: number, updatedAt: number }>
+// Cache structure: Map<userHandle, { path: string, text: string, mtime: number, size: number, contentHash: string, updatedAt: number }>
 const settingsFileCaches = new Map();
 // Lock structure: Map<userHandle, Promise<Object>>
 const settingsSaveLocks = new Map();
@@ -887,6 +892,28 @@ function getSettingsPath(req) {
     return path.join(req.user.directories.root, SETTINGS_FILE);
 }
 
+function shouldUseLazyThemeSettingsPayload(req) {
+    return String(req.get('x-baibaoku-lazy-themes') || '') === '1';
+}
+
+function getCurrentThemeNameFromSettingsText(text) {
+    try {
+        const settings = JSON.parse(text || '{}');
+        return typeof settings?.power_user?.theme === 'string' ? settings.power_user.theme : '';
+    } catch {
+        return '';
+    }
+}
+
+function getSettingsUpdateLockKey(userHandle, payloadOptions) {
+    const options = getSettingsPayloadOptions(payloadOptions);
+    return [
+        userHandle,
+        options.themeMode,
+        options.currentThemeName,
+    ].join('\0');
+}
+
 function getBaibaokuCacheDirectory(req) {
     return path.join(req.user.directories.root, 'baibaoku', 'cache');
 }
@@ -913,6 +940,7 @@ function cacheSettingsText(userHandle, settingsPath, text, stat) {
         text,
         mtime: stat.mtimeMs,
         size: stat.size,
+        contentHash: hashSettingsFileContent(text),
         updatedAt: Date.now(),
     });
     settingsResponseCaches.delete(userHandle);
@@ -939,6 +967,7 @@ async function persistSettingsTextToDisk(req, userHandle) {
         path: cached.path,
         mtime: cached.mtime,
         size: cached.size,
+        contentHash: cached.contentHash,
         updatedAt: cached.updatedAt,
         text: cached.text,
     };
@@ -961,16 +990,24 @@ async function restoreSettingsTextFromDisk(req, userHandle, settingsPath, stat) 
         || persisted.path !== settingsPath
         || persisted.mtime !== stat.mtimeMs
         || persisted.size !== stat.size
+        || typeof persisted.contentHash !== 'string'
         || typeof persisted.text !== 'string'
     ) {
         return null;
     }
 
+    const currentText = await fs.promises.readFile(settingsPath, 'utf8');
+    const currentHash = hashSettingsFileContent(currentText);
+    if (currentHash !== persisted.contentHash) {
+        return null;
+    }
+
     settingsFileCaches.set(userHandle, {
         path: settingsPath,
-        text: persisted.text,
+        text: currentText,
         mtime: stat.mtimeMs,
         size: stat.size,
+        contentHash: currentHash,
         updatedAt: Number(persisted.updatedAt) || Date.now(),
     });
 
@@ -981,24 +1018,30 @@ async function restoreSettingsTextFromDisk(req, userHandle, settingsPath, stat) 
     };
 }
 
-function hasFreshSettingsTextCache(userHandle, settingsPath, stat) {
+function getFreshSettingsTextCache(userHandle, settingsPath, stat) {
     const cached = settingsFileCaches.get(userHandle);
 
-    return Boolean(
-        cached
-        && cached.path === settingsPath
-        && cached.mtime === stat.mtimeMs
-        && cached.size === stat.size,
-    );
+    if (
+        !cached
+        || cached.path !== settingsPath
+        || cached.mtime !== stat.mtimeMs
+        || cached.size !== stat.size
+        || typeof cached.contentHash !== 'string'
+    ) {
+        return null;
+    }
+
+    return cached;
 }
 
 async function readSettingsTextWithCache(req, userHandle) {
     const settingsPath = getSettingsPath(req);
     const stat = await fs.promises.stat(settingsPath);
 
-    if (hasFreshSettingsTextCache(userHandle, settingsPath, stat)) {
+    const cached = getFreshSettingsTextCache(userHandle, settingsPath, stat);
+    if (cached) {
         return {
-            ...settingsFileCaches.get(userHandle),
+            ...cached,
             cacheHit: true,
             cacheStatus: 'hit',
         };
@@ -1055,9 +1098,8 @@ async function saveSettingsWithCache(req, userHandle) {
     }
 
     if (currentStat) {
-        const currentText = hasFreshSettingsTextCache(userHandle, settingsPath, currentStat)
-            ? settingsFileCaches.get(userHandle).text
-            : await fs.promises.readFile(settingsPath, 'utf8');
+        const cached = getFreshSettingsTextCache(userHandle, settingsPath, currentStat);
+        const currentText = cached ? cached.text : await fs.promises.readFile(settingsPath, 'utf8');
 
         if (currentText === text) {
             return { result: 'ok', skipped: true };
@@ -1187,6 +1229,8 @@ function getSettingsUserCache(userHandle) {
             payloadDirtyAt: Date.now(),
             payloadBuiltAt: 0,
             payloadCacheKey: '',
+            payloadThemeMode: SETTINGS_THEME_MODE_FULL,
+            payloadThemeCurrentName: '',
             payloadPersistedBuiltAt: 0,
             payloadPersistPromise: null,
             payloadWatchers: new Map(),
@@ -1309,10 +1353,33 @@ function ensureSettingsPayloadWatchers(userCache, directories) {
     }
 }
 
-function canUseCachedSettingsPayload(userCache) {
+function normalizeSettingsThemeMode(mode) {
+    return mode === SETTINGS_THEME_MODE_LAZY ? SETTINGS_THEME_MODE_LAZY : SETTINGS_THEME_MODE_FULL;
+}
+
+function getSettingsPayloadOptions(options = {}) {
+    const themeMode = normalizeSettingsThemeMode(options.themeMode);
+    return {
+        themeMode,
+        currentThemeName: themeMode === SETTINGS_THEME_MODE_LAZY ? String(options.currentThemeName || '') : '',
+    };
+}
+
+function getCurrentSettingsPayloadOptions(userCache) {
+    return getSettingsPayloadOptions({
+        themeMode: userCache.payloadThemeMode,
+        currentThemeName: userCache.payloadThemeCurrentName,
+    });
+}
+
+function canUseCachedSettingsPayload(userCache, options = {}) {
+    const payloadOptions = getSettingsPayloadOptions(options);
+
     return Boolean(
         userCache.payload
-        && !userCache.payloadDirty,
+        && !userCache.payloadDirty
+        && userCache.payloadThemeMode === payloadOptions.themeMode
+        && userCache.payloadThemeCurrentName === payloadOptions.currentThemeName,
     );
 }
 
@@ -1370,11 +1437,14 @@ function computeSettingsPayloadCacheKey(userCache, payload) {
                 name: entry.name,
                 contentHash: entry.contentHash || null,
                 size: entry.size,
+                themeIndexVersion: entry.themeIndexVersion || null,
             }));
     }
 
     return hashSettingsJson({
         version: SETTINGS_PAYLOAD_PERSIST_VERSION,
+        themeMode: userCache.payloadThemeMode || SETTINGS_THEME_MODE_FULL,
+        themeCurrentName: userCache.payloadThemeCurrentName || '',
         sections,
         world_names: Array.isArray(payload?.world_names) ? payload.world_names : [],
     });
@@ -1411,7 +1481,10 @@ async function updateCachedJsonDirectory(sectionCache, directoryPath, options) {
         }
 
         const cached = sectionCache.get(filename);
-        if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
+        const cachedHasValue = valueMode === 'raw-json'
+            ? typeof cached?.value === 'string'
+            : cached?.value !== undefined;
+        if (cached && cachedHasValue && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
             return;
         }
 
@@ -1436,6 +1509,197 @@ async function updateCachedJsonDirectory(sectionCache, directoryPath, options) {
     return files
         .map(filename => sectionCache.get(filename))
         .filter(Boolean);
+}
+
+function getThemeFallbackName(filename) {
+    return path.parse(filename).name;
+}
+
+function getThemeNameFromParsedFile(parsed, filename) {
+    const name = typeof parsed?.name === 'string' && parsed.name.trim()
+        ? parsed.name
+        : getThemeFallbackName(filename);
+    return name;
+}
+
+function makeLazyThemeStub(name) {
+    return {
+        name,
+        [SETTINGS_LAZY_THEME_MARKER]: true,
+    };
+}
+
+async function updateCachedThemeIndexDirectory(sectionCache, directoryPath) {
+    const files = (await fs.promises.readdir(directoryPath))
+        .filter(file => path.parse(file).ext === '.json')
+        .sort();
+    const currentFiles = new Set(files);
+
+    for (const cachedFile of sectionCache.keys()) {
+        if (!currentFiles.has(cachedFile)) {
+            sectionCache.delete(cachedFile);
+        }
+    }
+
+    await Promise.all(files.map(async (filename) => {
+        const filePath = path.join(directoryPath, filename);
+        let stat;
+
+        try {
+            stat = await fs.promises.stat(filePath);
+        } catch {
+            sectionCache.delete(filename);
+            return;
+        }
+
+        const cached = sectionCache.get(filename);
+        if (
+            cached
+            && cached.mtime === stat.mtimeMs
+            && cached.size === stat.size
+            && typeof cached.name === 'string'
+            && typeof cached.contentHash === 'string'
+            && cached.themeIndexVersion === SETTINGS_THEME_INDEX_CACHE_VERSION
+        ) {
+            delete cached.value;
+            return;
+        }
+
+        try {
+            const file = await fs.promises.readFile(filePath, 'utf8');
+            const parsed = JSON.parse(file);
+            const next = {
+                ...(cached || {}),
+                mtime: stat.mtimeMs,
+                size: stat.size,
+                contentHash: hashSettingsFileContent(file),
+                name: getThemeNameFromParsedFile(parsed, filename),
+                themeIndexVersion: SETTINGS_THEME_INDEX_CACHE_VERSION,
+            };
+            delete next.value;
+            sectionCache.set(filename, next);
+        } catch {
+            sectionCache.delete(filename);
+        }
+    }));
+
+    const entries = files
+        .map(filename => {
+            const entry = sectionCache.get(filename);
+            return entry ? { filename, ...entry } : null;
+        })
+        .filter(Boolean);
+    const nameToFilename = new Map();
+
+    for (const entry of entries) {
+        if (!nameToFilename.has(entry.name)) {
+            nameToFilename.set(entry.name, entry.filename);
+        }
+    }
+
+    return { entries, nameToFilename };
+}
+
+async function readCachedThemeFile(sectionCache, directoryPath, filename) {
+    const filePath = path.join(directoryPath, filename);
+    const stat = await fs.promises.stat(filePath);
+    const cached = sectionCache.get(filename);
+
+    if (cached?.value && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
+        return cached.value;
+    }
+
+    const file = await fs.promises.readFile(filePath, 'utf8');
+    const parsed = JSON.parse(file);
+    parsed.name = getThemeNameFromParsedFile(parsed, filename);
+    sectionCache.set(filename, {
+        ...(cached || {}),
+        mtime: stat.mtimeMs,
+        size: stat.size,
+        contentHash: hashSettingsFileContent(file),
+        name: parsed.name,
+        themeIndexVersion: SETTINGS_THEME_INDEX_CACHE_VERSION,
+        value: parsed,
+    });
+    return parsed;
+}
+
+async function readLazyThemeDirectory(userCache, directoryPath, currentThemeName) {
+    const sectionCache = getSettingsSectionCache(userCache, 'themes');
+    const { entries, nameToFilename } = await updateCachedThemeIndexDirectory(sectionCache, directoryPath);
+    const namesToLoad = new Set();
+    const firstThemeName = entries[0]?.name || '';
+
+    if (firstThemeName) {
+        namesToLoad.add(firstThemeName);
+    }
+    if (currentThemeName && nameToFilename.has(currentThemeName)) {
+        namesToLoad.add(currentThemeName);
+    }
+
+    const fullThemesByName = new Map();
+    await Promise.all(Array.from(namesToLoad).map(async (name) => {
+        const filename = nameToFilename.get(name);
+        if (!filename) {
+            return;
+        }
+        fullThemesByName.set(name, await readCachedThemeFile(sectionCache, directoryPath, filename));
+    }));
+
+    return entries.map(entry => fullThemesByName.get(entry.name) || makeLazyThemeStub(entry.name));
+}
+
+async function readThemeByName(userCache, directoryPath, themeName) {
+    const sectionCache = getSettingsSectionCache(userCache, 'themes');
+    const { nameToFilename } = await updateCachedThemeIndexDirectory(sectionCache, directoryPath);
+    let filename = nameToFilename.get(themeName);
+
+    if (!filename) {
+        const fallbackFilename = `${sanitize(themeName)}.json`;
+        if (fallbackFilename && sectionCache.has(fallbackFilename)) {
+            filename = fallbackFilename;
+        }
+    }
+
+    if (!filename) {
+        return null;
+    }
+
+    return {
+        filename,
+        theme: await readCachedThemeFile(sectionCache, directoryPath, filename),
+    };
+}
+
+async function invalidateCachedSettingsPayloadIfThemeDirectoryChanged(userCache, directoryPath) {
+    if (!userCache.payload || userCache.payloadDirty || !directoryPath) {
+        return false;
+    }
+
+    const sectionCache = userCache.sections.get('themes');
+    if (!sectionCache) {
+        markSettingsPayloadDirty(userCache, 'theme-directory-signature-missing');
+        return true;
+    }
+
+    const signature = await getJsonDirectorySignature(directoryPath);
+    const currentFiles = Object.keys(signature).sort((a, b) => a.localeCompare(b));
+    const cachedFiles = Array.from(sectionCache.keys()).sort((a, b) => a.localeCompare(b));
+    const changed = currentFiles.length !== cachedFiles.length || currentFiles.some((filename, index) => {
+        if (filename !== cachedFiles[index]) {
+            return true;
+        }
+
+        const current = signature[filename];
+        const cached = sectionCache.get(filename);
+        return cached?.mtime !== current?.mtime || cached?.size !== current?.size;
+    });
+
+    if (changed) {
+        markSettingsPayloadDirty(userCache, 'theme-directory-signature-changed');
+    }
+
+    return changed;
 }
 
 async function readWorldNames(directoryPath) {
@@ -1547,7 +1811,21 @@ async function writeFileAtomicAsync(filePath, data, options = 'utf8') {
     }
 }
 
-async function restoreSettingsPayloadFromDisk(req, userHandle, directories) {
+function restorePersistedSectionCache(userCache, sectionName, persistedSection) {
+    if (!persistedSection?.files || typeof persistedSection.files !== 'object') {
+        return false;
+    }
+
+    const sectionCache = new Map();
+    for (const [filename, entry] of Object.entries(persistedSection.files)) {
+        sectionCache.set(filename, entry);
+    }
+    userCache.sections.set(sectionName, sectionCache);
+    return true;
+}
+
+async function restoreSettingsPayloadFromDisk(req, userHandle, directories, options = {}) {
+    const payloadOptions = getSettingsPayloadOptions(options);
     const persistPath = getSettingsPayloadPersistPath(req);
     let persisted;
 
@@ -1558,6 +1836,21 @@ async function restoreSettingsPayloadFromDisk(req, userHandle, directories) {
     }
 
     if (persisted?.version !== SETTINGS_PAYLOAD_PERSIST_VERSION || !persisted.payload || !persisted.sections) {
+        return false;
+    }
+
+    const persistedThemeMode = normalizeSettingsThemeMode(persisted.themeMode);
+    const persistedThemeCurrentName = persistedThemeMode === SETTINGS_THEME_MODE_LAZY
+        ? String(persisted.themeCurrentName || '')
+        : '';
+
+    if (
+        persistedThemeMode !== payloadOptions.themeMode
+        || persistedThemeCurrentName !== payloadOptions.currentThemeName
+    ) {
+        if (payloadOptions.themeMode === SETTINGS_THEME_MODE_LAZY && persisted.sections?.themes) {
+            restorePersistedSectionCache(getSettingsUserCache(userHandle), 'themes', persisted.sections.themes);
+        }
         return false;
     }
 
@@ -1585,17 +1878,15 @@ async function restoreSettingsPayloadFromDisk(req, userHandle, directories) {
     userCache.sections.clear();
 
     for (const [sectionName, persistedSection] of Object.entries(persisted.sections)) {
-        const sectionCache = new Map();
-        for (const [filename, entry] of Object.entries(persistedSection.files || {})) {
-            sectionCache.set(filename, entry);
-        }
-        userCache.sections.set(sectionName, sectionCache);
+        restorePersistedSectionCache(userCache, sectionName, persistedSection);
     }
 
     userCache.payload = persisted.payload;
     userCache.payloadDirty = false;
     userCache.payloadDirtyReason = '';
     userCache.payloadDirtyAt = 0;
+    userCache.payloadThemeMode = payloadOptions.themeMode;
+    userCache.payloadThemeCurrentName = payloadOptions.currentThemeName;
     userCache.payloadBuiltAt = Number(persisted.payloadBuiltAt) || Date.now();
     userCache.payloadCacheKey = persisted.payloadCacheKey || computeSettingsPayloadCacheKey(userCache, persisted.payload);
     userCache.payloadPersistedBuiltAt = restoreState.reconciled ? 0 : userCache.payloadBuiltAt;
@@ -1604,8 +1895,9 @@ async function restoreSettingsPayloadFromDisk(req, userHandle, directories) {
 
 function ensureSettingsPayloadPersisted(req, userHandle) {
     const userCache = getSettingsUserCache(userHandle);
+    const payloadOptions = getCurrentSettingsPayloadOptions(userCache);
 
-    if (!canUseCachedSettingsPayload(userCache)) {
+    if (!canUseCachedSettingsPayload(userCache, payloadOptions)) {
         return null;
     }
 
@@ -1632,8 +1924,9 @@ function ensureSettingsPayloadPersisted(req, userHandle) {
 
 async function persistSettingsPayloadToDisk(req, userHandle) {
     const userCache = getSettingsUserCache(userHandle);
+    const payloadOptions = getCurrentSettingsPayloadOptions(userCache);
 
-    if (!canUseCachedSettingsPayload(userCache)) {
+    if (!canUseCachedSettingsPayload(userCache, payloadOptions)) {
         return false;
     }
 
@@ -1663,13 +1956,15 @@ async function persistSettingsPayloadToDisk(req, userHandle) {
         version: SETTINGS_PAYLOAD_PERSIST_VERSION,
         savedAt: Date.now(),
         payloadBuiltAt,
+        themeMode: payloadOptions.themeMode,
+        themeCurrentName: payloadOptions.currentThemeName,
         payloadCacheKey: userCache.payloadCacheKey || computeSettingsPayloadCacheKey(userCache, cachedPayload),
         sections: Object.fromEntries(Object.entries(sections).filter(([sectionName]) => sectionName !== '__worlds__')),
         worlds: sections.__worlds__ || { signature: {} },
         payload: cachedPayload,
     };
 
-    if (!canUseCachedSettingsPayload(userCache) || userCache.payload !== cachedPayload || userCache.payloadBuiltAt !== payloadBuiltAt) {
+    if (!canUseCachedSettingsPayload(userCache, payloadOptions) || userCache.payload !== cachedPayload || userCache.payloadBuiltAt !== payloadBuiltAt) {
         return false;
     }
 
@@ -1678,21 +1973,32 @@ async function persistSettingsPayloadToDisk(req, userHandle) {
     return true;
 }
 
-async function getFastSettingsPayload(req, userHandle, metrics = {}) {
+async function getFastSettingsPayload(req, userHandle, metrics = {}, options = {}) {
     const userCache = getSettingsUserCache(userHandle);
     const directories = req.user.directories;
+    const payloadOptions = getSettingsPayloadOptions(options);
 
     ensureSettingsPayloadWatchers(userCache, directories);
 
-    if (canUseCachedSettingsPayload(userCache)) {
+    if (payloadOptions.themeMode === SETTINGS_THEME_MODE_LAZY) {
+        await invalidateCachedSettingsPayloadIfThemeDirectoryChanged(userCache, directories.themes);
+    }
+
+    if (canUseCachedSettingsPayload(userCache, payloadOptions)) {
         metrics.payloadCache = 'hit';
+        metrics.payloadThemeMode = payloadOptions.themeMode;
         return userCache.payload;
     }
 
-    if (!userCache.payload) {
+    if (
+        !userCache.payload
+        || userCache.payloadThemeMode !== payloadOptions.themeMode
+        || userCache.payloadThemeCurrentName !== payloadOptions.currentThemeName
+    ) {
         try {
-            if (await restoreSettingsPayloadFromDisk(req, userHandle, directories)) {
+            if (await restoreSettingsPayloadFromDisk(req, userHandle, directories, payloadOptions)) {
                 metrics.payloadCache = 'persistent-hit';
+                metrics.payloadThemeMode = payloadOptions.themeMode;
                 return userCache.payload;
             }
         } catch (error) {
@@ -1701,15 +2007,20 @@ async function getFastSettingsPayload(req, userHandle, metrics = {}) {
     }
 
     metrics.payloadCache = userCache.payload ? 'stale' : 'miss';
+    metrics.payloadThemeMode = payloadOptions.themeMode;
     metrics.payloadDirtyReason = userCache.payloadDirtyReason || '';
     metrics.payloadDirtyAgeMs = userCache.payloadDirtyAt ? Date.now() - userCache.payloadDirtyAt : 0;
 
-    return buildFastSettingsPayload(req, userHandle);
+    return buildFastSettingsPayload(req, userHandle, payloadOptions);
 }
 
-async function buildFastSettingsPayload(req, userHandle) {
+async function buildFastSettingsPayload(req, userHandle, options = {}) {
     const userCache = getSettingsUserCache(userHandle);
     const directories = req.user.directories;
+    const payloadOptions = getSettingsPayloadOptions(options);
+    const themesPromise = payloadOptions.themeMode === SETTINGS_THEME_MODE_LAZY
+        ? readLazyThemeDirectory(userCache, directories.themes, payloadOptions.currentThemeName)
+        : readCachedParsedDirectory(userCache, 'themes', directories.themes);
 
     const [
         kobold,
@@ -1730,7 +2041,7 @@ async function buildFastSettingsPayload(req, userHandle) {
         readCachedPresetDirectory(userCache, 'openai_settings', directories.openAI_Settings),
         readCachedPresetDirectory(userCache, 'textgenerationwebui_presets', directories.textGen_Settings),
         readWorldNames(directories.worlds),
-        readCachedParsedDirectory(userCache, 'themes', directories.themes),
+        themesPromise,
         readCachedParsedDirectory(userCache, 'movingUIPresets', directories.movingUI),
         readCachedParsedDirectory(userCache, 'quickReplyPresets', directories.quickreplies),
         readCachedParsedDirectory(userCache, 'instruct', directories.instruct),
@@ -1762,6 +2073,8 @@ async function buildFastSettingsPayload(req, userHandle) {
     userCache.payloadDirty = false;
     userCache.payloadDirtyReason = '';
     userCache.payloadDirtyAt = 0;
+    userCache.payloadThemeMode = payloadOptions.themeMode;
+    userCache.payloadThemeCurrentName = payloadOptions.currentThemeName;
     userCache.payloadBuiltAt = Date.now();
     userCache.payloadCacheKey = computeSettingsPayloadCacheKey(userCache, payload);
     ensureSettingsPayloadPersisted(req, userHandle);
@@ -1920,6 +2233,7 @@ function getFastSettingsResponseKey(userHandle, settingsInfo, staticPayload) {
         settingsInfo.path,
         settingsInfo.mtime,
         settingsInfo.size,
+        settingsInfo.contentHash || '',
         userCache.payloadCacheKey || userCache.payloadBuiltAt,
         hashSettingsJson(staticPayload),
     ].join('\0');
@@ -1995,6 +2309,7 @@ function sameSettingsInfo(left, right) {
         && left.path === right.path
         && left.mtime === right.mtime
         && left.size === right.size
+        && left.contentHash === right.contentHash
         && left.updatedAt === right.updatedAt,
     );
 }
@@ -2010,8 +2325,9 @@ function scheduleSettingsResponseWarmup(req, userHandle, reason = 'unknown') {
 
 async function warmSettingsResponseCache(req, userHandle) {
     const userCache = getSettingsUserCache(userHandle);
+    const payloadOptions = getCurrentSettingsPayloadOptions(userCache);
 
-    if (!canUseCachedSettingsPayload(userCache)) {
+    if (payloadOptions.themeMode !== SETTINGS_THEME_MODE_FULL || !canUseCachedSettingsPayload(userCache, payloadOptions)) {
         return false;
     }
 
@@ -2019,7 +2335,7 @@ async function warmSettingsResponseCache(req, userHandle) {
     const payloadBuiltAt = userCache.payloadBuiltAt;
     const settingsInfo = await readSettingsTextWithCache(req, userHandle);
 
-    if (!canUseCachedSettingsPayload(userCache) || userCache.payload !== cachedPayload || userCache.payloadBuiltAt !== payloadBuiltAt) {
+    if (!canUseCachedSettingsPayload(userCache, payloadOptions) || userCache.payload !== cachedPayload || userCache.payloadBuiltAt !== payloadBuiltAt) {
         return false;
     }
 
@@ -2034,7 +2350,7 @@ async function warmSettingsResponseCache(req, userHandle) {
     const nextCache = buildFastSettingsResponseCache(key, settingsInfo, cachedPayload, staticPayload);
 
     if (
-        !canUseCachedSettingsPayload(userCache)
+        !canUseCachedSettingsPayload(userCache, payloadOptions)
         || userCache.payload !== cachedPayload
         || userCache.payloadBuiltAt !== payloadBuiltAt
         || !sameSettingsInfo(settingsInfo, settingsFileCaches.get(userHandle))
@@ -2136,6 +2452,7 @@ function makeEarlyBridgeScript(options = {}) {
     const apiPrefix = `/api/plugins/${PLUGIN_ID}`;
     const fastSettingsGetPath = `${apiPrefix}/v1/settings/fast-get`;
     const fastSettingsSavePath = `${apiPrefix}/v1/settings/fast-save`;
+    const fastThemeGetPath = `${apiPrefix}/v1/themes/get`;
     const fastCharacterListPath = `${apiPrefix}/v1/characters/fast-all`;
     const fastRecentChatListPath = `${apiPrefix}/v1/chats/fast-recent`;
     const extensionManifestBundlePath = `${apiPrefix}/v1/extensions/manifest-bundle`;
@@ -2153,9 +2470,11 @@ function makeEarlyBridgeScript(options = {}) {
   var VERSION = ${JSON.stringify(String(EARLY_BRIDGE_VERSION))};
   var FAST_SETTINGS_GET = ${JSON.stringify(fastSettingsGetPath)};
   var FAST_SETTINGS_SAVE = ${JSON.stringify(fastSettingsSavePath)};
+  var FAST_THEME_GET = ${JSON.stringify(fastThemeGetPath)};
   var FAST_CHARACTER_LIST = ${JSON.stringify(fastCharacterListPath)};
   var FAST_RECENT_CHAT_LIST = ${JSON.stringify(fastRecentChatListPath)};
   var EXTENSION_MANIFEST_BUNDLE = ${JSON.stringify(extensionManifestBundlePath)};
+  var LAZY_THEME_MARKER = ${JSON.stringify(SETTINGS_LAZY_THEME_MARKER)};
   var SETTINGS_ACCELERATION_ENABLED = ${JSON.stringify(settingsAccelerationEnabled)};
   var CHARACTER_LIST_ACCELERATION_ENABLED = ${JSON.stringify(characterListAccelerationEnabled)};
   var RECENT_CHAT_LIST_ACCELERATION_ENABLED = ${JSON.stringify(recentChatListAccelerationEnabled)};
@@ -2180,11 +2499,13 @@ function makeEarlyBridgeScript(options = {}) {
   state.installedAt = Date.now();
   state.fastGetPath = FAST_SETTINGS_GET;
   state.fastSavePath = FAST_SETTINGS_SAVE;
+  state.fastThemeGetPath = FAST_THEME_GET;
   state.fastCharacterListPath = FAST_CHARACTER_LIST;
   state.fastRecentChatListPath = FAST_RECENT_CHAT_LIST;
   state.extensionManifestBundlePath = EXTENSION_MANIFEST_BUNDLE;
-  state.requests = state.requests || { get: 0, save: 0, characters: 0, recentChats: 0, extensionBundle: 0, extensionManifest: 0, extensionManifestRefresh: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
+  state.requests = state.requests || { get: 0, save: 0, themeGet: 0, characters: 0, recentChats: 0, extensionBundle: 0, extensionManifest: 0, extensionManifestRefresh: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
   if (typeof state.requests.saveFrontendCache !== 'number') state.requests.saveFrontendCache = 0;
+  if (typeof state.requests.themeGet !== 'number') state.requests.themeGet = 0;
   if (typeof state.requests.recentChats !== 'number') state.requests.recentChats = 0;
   if (typeof state.requests.extensionBundle !== 'number') state.requests.extensionBundle = 0;
   if (typeof state.requests.extensionManifest !== 'number') state.requests.extensionManifest = 0;
@@ -2194,6 +2515,12 @@ function makeEarlyBridgeScript(options = {}) {
   state.settingsGetPending = null;
   state.settingsSaveCache = state.settingsSaveCache || null;
   state.settingsSavePending = null;
+  state.settingsRequestHeaders = state.settingsRequestHeaders || null;
+  state.lazyThemesArray = state.lazyThemesArray || null;
+  if (!state.lazyThemeFetchPending || typeof state.lazyThemeFetchPending !== 'object') {
+    state.lazyThemeFetchPending = Object.create(null);
+  }
+  state.lazyThemeCurrentName = state.lazyThemeCurrentName || '';
   state.extensionManifestBundleCache = state.extensionManifestBundleCache || null;
   state.extensionManifestBundlePending = null;
 
@@ -2325,9 +2652,12 @@ function makeEarlyBridgeScript(options = {}) {
     }
     state.settingsGetCache = null;
     state.settingsGetPending = null;
+    state.lazyThemesArray = null;
     state.lastInvalidationReason = reason || 'unknown';
     state.lastInvalidatedAt = Date.now();
   }
+
+  state.clearSettingsGetCache = clearSettingsGetCache;
 
   function clearSettingsSaveCache(reason) {
     state.settingsSaveCache = null;
@@ -2341,12 +2671,146 @@ function makeEarlyBridgeScript(options = {}) {
     headers.set('content-type', 'application/json; charset=utf-8');
     headers.set('x-baibaoku-frontend-cache', source || 'hit');
     headers.set('x-baibaoku-frontend-cache-age-ms', String(Date.now() - cache.savedAt));
-    return new Response(cache.text, {
+    return decorateSettingsGetResponse(new Response(cache.text, {
       status: cache.status || 200,
       statusText: cache.statusText || 'OK',
       headers: headers,
-    });
+    }), cache.text);
   }
+
+  function rememberSettingsRequestHeaders(headers) {
+    var next = {};
+    try {
+      new Headers(headers || undefined).forEach(function (value, key) {
+        if (!/^content-length$/i.test(key)) {
+          next[key] = value;
+        }
+      });
+      state.settingsRequestHeaders = next;
+    } catch (_) {}
+  }
+
+  function getPluginJsonHeaders() {
+    var headers = new Headers();
+    try {
+      var remembered = new Headers(state.settingsRequestHeaders || undefined);
+      var csrf = remembered.get('x-csrf-token');
+      if (csrf) {
+        headers.set('x-csrf-token', csrf);
+      }
+    } catch (_) {}
+    headers.set('content-type', 'application/json');
+    return headers;
+  }
+
+  function getSettingsThemeNameFromPayload(data) {
+    if (!data || typeof data.settings !== 'string') return '';
+    var parsed = parseJsonOrNull(data.settings);
+    return typeof (parsed && parsed.power_user && parsed.power_user.theme) === 'string'
+      ? parsed.power_user.theme
+      : '';
+  }
+
+  function captureSettingsGetPayload(data) {
+    if (!data || typeof data !== 'object') return data;
+    if (Array.isArray(data.themes)) {
+      state.lazyThemesArray = data.themes;
+      state.lazyThemeCurrentName = getSettingsThemeNameFromPayload(data) || state.lazyThemeCurrentName || '';
+    }
+    return data;
+  }
+
+  function decorateSettingsGetResponse(response, text) {
+    if (!response || typeof text !== 'string') return response;
+    var parsedPromise = null;
+    response.json = function () {
+      if (!parsedPromise) {
+        parsedPromise = Promise.resolve().then(function () {
+          var parsed = JSON.parse(text);
+          return captureSettingsGetPayload(parsed);
+        });
+      }
+      return parsedPromise;
+    };
+    return response;
+  }
+
+  function isLazyThemeObject(theme) {
+    return Boolean(theme && typeof theme === 'object' && theme[LAZY_THEME_MARKER] === true);
+  }
+
+  function findThemeSlot(name) {
+    var themes = Array.isArray(state.lazyThemesArray) ? state.lazyThemesArray : [];
+    for (var i = 0; i < themes.length; i += 1) {
+      var theme = themes[i];
+      if (theme && theme.name === name) {
+        return { theme: theme, index: i };
+      }
+    }
+    return null;
+  }
+
+  function isThemeLoaded(name) {
+    var slot = findThemeSlot(name);
+    return Boolean(slot && !isLazyThemeObject(slot.theme));
+  }
+
+  function isThemeLazy(name) {
+    var slot = findThemeSlot(name);
+    return Boolean(slot && isLazyThemeObject(slot.theme));
+  }
+
+  async function ensureThemeLoaded(name) {
+    name = String(name || '');
+    if (!name) return null;
+
+    var slot = findThemeSlot(name);
+    if (!slot) return null;
+    if (!isLazyThemeObject(slot.theme)) return slot.theme;
+
+    if (state.lazyThemeFetchPending[name]) {
+      return state.lazyThemeFetchPending[name];
+    }
+
+    state.requests.themeGet += 1;
+    state.lazyThemeFetchPending[name] = rawFetch(FAST_THEME_GET, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: getPluginJsonHeaders(),
+      body: JSON.stringify({ name: name }),
+    }).then(async function (response) {
+      if (!response || !response.ok) {
+        throw new Error('Theme request failed: ' + (response ? response.status : 'no response'));
+      }
+
+      var payload = await response.json();
+      var theme = payload && payload.data;
+      if (!theme || typeof theme !== 'object' || Array.isArray(theme)) {
+        throw new Error('Theme response payload is invalid');
+      }
+
+      if (typeof theme.name !== 'string' || !theme.name) {
+        theme.name = name;
+      }
+
+      var currentSlot = findThemeSlot(name) || slot;
+      Object.keys(currentSlot.theme).forEach(function (key) {
+        delete currentSlot.theme[key];
+      });
+      Object.assign(currentSlot.theme, theme);
+      delete currentSlot.theme[LAZY_THEME_MARKER];
+      state.lazyThemeCurrentName = name;
+      return currentSlot.theme;
+    }).finally(function () {
+      delete state.lazyThemeFetchPending[name];
+    });
+
+    return state.lazyThemeFetchPending[name];
+  }
+
+  state.ensureThemeLoaded = ensureThemeLoaded;
+  state.isThemeLoaded = isThemeLoaded;
+  state.isThemeLazy = isThemeLazy;
 
   function makeCachedSettingsSaveResponse(cache, source) {
     var headers = new Headers(cache.headers || undefined);
@@ -2825,6 +3289,11 @@ function makeEarlyBridgeScript(options = {}) {
 
       var fastInit = await makeFastInit(input, init, method);
 
+      if (route.kind === 'get') {
+        fastInit.headers.set('x-baibaoku-lazy-themes', '1');
+        rememberSettingsRequestHeaders(fastInit.headers);
+      }
+
       if (route.kind === 'save') {
         var saveKey = await getSettingsSaveKey(fastInit.body);
         if (saveKey && state.settingsSavePending && state.settingsSavePending.key === saveKey) {
@@ -2885,6 +3354,8 @@ function makeEarlyBridgeScript(options = {}) {
             .finally(function () {
               state.settingsGetPending = null;
             });
+          var settingsGetCache = await state.settingsGetPending;
+          return makeCachedSettingsGetResponse(settingsGetCache, 'miss');
         } else if (route.kind === 'characters') {
           var characterData = await response.clone().json().catch(function () { return null; });
           if (!Array.isArray(characterData)) {
@@ -3183,6 +3654,42 @@ export function registerStEndpoints(router, manager) {
         }
     });
 
+    router.post('/v1/themes/get', async (req, res) => {
+        const startedAt = Date.now();
+
+        try {
+            const userHandle = req.user?.profile?.handle;
+            if (!userHandle) {
+                return res.status(401).json({ ok: false, error: true, message: 'Unauthorized' });
+            }
+
+            const name = String(req.body?.name || '').trim();
+            if (!name) {
+                return res.status(400).json({ ok: false, error: true, message: 'Theme name is required.' });
+            }
+
+            const result = await readThemeByName(
+                getSettingsUserCache(userHandle),
+                req.user.directories.themes,
+                name,
+            );
+
+            if (!result) {
+                return res.status(404).json({ ok: false, error: true, message: 'Theme not found.' });
+            }
+
+            res.set('X-Baibaoku-Elapsed-Ms', String(Date.now() - startedAt));
+            res.set('X-Baibaoku-Theme-File', encodeURIComponent(result.filename));
+            res.json({
+                ok: true,
+                data: result.theme,
+            });
+        } catch (error) {
+            console.error('[baibaoku] Error in theme get endpoint:', error);
+            res.status(500).json({ ok: false, error: true, message: error.message });
+        }
+    });
+
     router.post('/v1/settings/fast-get', async (req, res) => {
         const startedAt = Date.now();
 
@@ -3194,6 +3701,7 @@ export function registerStEndpoints(router, manager) {
             }
 
             await waitForPendingSettingsSave(userHandle);
+            const lazyThemes = shouldUseLazyThemeSettingsPayload(req);
             const settingsStartedAt = Date.now();
             const settingsPromise = readSettingsTextWithCache(req, userHandle)
                 .then((settingsInfo) => {
@@ -3202,19 +3710,44 @@ export function registerStEndpoints(router, manager) {
                     return settingsInfo;
                 });
 
-            if (!settingsUpdateLocks.has(userHandle)) {
-                const updatePromise = getFastSettingsPayload(req, userHandle, metrics)
-                    .finally(() => settingsUpdateLocks.delete(userHandle));
-                settingsUpdateLocks.set(userHandle, updatePromise);
-            } else {
-                metrics.payloadCache = 'shared';
-            }
+            let payloadStartedAt = Date.now();
+            let settingsInfo;
+            let cachedPayload;
 
-            const payloadStartedAt = Date.now();
-            const [settingsInfo, cachedPayload] = await Promise.all([
-                settingsPromise,
-                settingsUpdateLocks.get(userHandle),
-            ]);
+            if (lazyThemes) {
+                settingsInfo = await settingsPromise;
+                payloadStartedAt = Date.now();
+                const payloadOptions = {
+                    themeMode: SETTINGS_THEME_MODE_LAZY,
+                    currentThemeName: getCurrentThemeNameFromSettingsText(settingsInfo.text),
+                };
+                const lockKey = getSettingsUpdateLockKey(userHandle, payloadOptions);
+                if (!settingsUpdateLocks.has(lockKey)) {
+                    const updatePromise = getFastSettingsPayload(req, userHandle, metrics, payloadOptions)
+                        .finally(() => settingsUpdateLocks.delete(lockKey));
+                    settingsUpdateLocks.set(lockKey, updatePromise);
+                } else {
+                    metrics.payloadCache = 'shared';
+                    metrics.payloadThemeMode = payloadOptions.themeMode;
+                }
+                cachedPayload = await settingsUpdateLocks.get(lockKey);
+            } else {
+                const payloadOptions = { themeMode: SETTINGS_THEME_MODE_FULL };
+                const lockKey = getSettingsUpdateLockKey(userHandle, payloadOptions);
+                if (!settingsUpdateLocks.has(lockKey)) {
+                    const updatePromise = getFastSettingsPayload(req, userHandle, metrics, payloadOptions)
+                        .finally(() => settingsUpdateLocks.delete(lockKey));
+                    settingsUpdateLocks.set(lockKey, updatePromise);
+                } else {
+                    metrics.payloadCache = 'shared';
+                    metrics.payloadThemeMode = payloadOptions.themeMode;
+                }
+
+                [settingsInfo, cachedPayload] = await Promise.all([
+                    settingsPromise,
+                    settingsUpdateLocks.get(lockKey),
+                ]);
+            }
             metrics.payloadMs = Date.now() - payloadStartedAt;
             ensureSettingsPayloadPersisted(req, userHandle);
 
@@ -3239,6 +3772,7 @@ export function registerStEndpoints(router, manager) {
             res.set('X-Baibaoku-Elapsed-Ms', String(metrics.totalMs));
             res.set('X-Baibaoku-Settings-Cache', metrics.settingsCache);
             res.set('X-Baibaoku-Payload-Cache', metrics.payloadCache);
+            res.set('X-Baibaoku-Payload-Theme-Mode', metrics.payloadThemeMode || SETTINGS_THEME_MODE_FULL);
             if (metrics.payloadDirtyReason) {
                 res.set('X-Baibaoku-Payload-Dirty-Reason', metrics.payloadDirtyReason.slice(0, 512));
                 res.set('X-Baibaoku-Payload-Dirty-Age-Ms', String(metrics.payloadDirtyAgeMs || 0));
