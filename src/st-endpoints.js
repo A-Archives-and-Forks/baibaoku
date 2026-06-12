@@ -19,6 +19,7 @@ import {
     closeSaveGenerateJobs,
     registerSaveGenerateEndpoints,
 } from './save-generate.js';
+import { setSafeHeader } from './header-utils.js';
 
 const FAST_CHARACTER_CACHE_DATABASE = 'baibaoku.internal';
 const FAST_CHARACTER_CACHE_STORE = 'character-fast-all';
@@ -3545,11 +3546,11 @@ export function registerStEndpoints(router, manager) {
         try {
             const { data, metrics } = await getFastRecentChats(req);
 
-            res.set('X-Baibaoku-Elapsed-Ms', String(metrics.totalMs));
-            res.set('X-Baibaoku-Recent-Selected-Files', String(metrics.selectedFiles));
-            res.set('X-Baibaoku-Recent-Character-Files', String(metrics.characterFiles));
-            res.set('X-Baibaoku-Recent-Group-Files', String(metrics.groupFiles));
-            res.set('X-Baibaoku-Recent-Root-Files', String(metrics.rootFiles));
+            setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', metrics.totalMs);
+            setSafeHeader(res, 'X-Baibaoku-Recent-Selected-Files', metrics.selectedFiles);
+            setSafeHeader(res, 'X-Baibaoku-Recent-Character-Files', metrics.characterFiles);
+            setSafeHeader(res, 'X-Baibaoku-Recent-Group-Files', metrics.groupFiles);
+            setSafeHeader(res, 'X-Baibaoku-Recent-Root-Files', metrics.rootFiles);
             res.json(data);
         } catch (error) {
             console.error('[baibaoku] Error in fast-recent endpoint:', error);
@@ -3567,10 +3568,10 @@ export function registerStEndpoints(router, manager) {
         try {
             const result = await getFastChatGet(req);
 
-            res.set('X-Baibaoku-Elapsed-Ms', String(result.meta.elapsedMs || 0));
-            res.set('X-Baibaoku-Chat-Kind', String(result.kind));
-            res.set('X-Baibaoku-Chat-Partial', String(result.meta.partial === true));
-            res.set('X-Baibaoku-Chat-Total-Messages', String(result.meta.totalMessages || 0));
+            setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', result.meta.elapsedMs || 0);
+            setSafeHeader(res, 'X-Baibaoku-Chat-Kind', result.kind);
+            setSafeHeader(res, 'X-Baibaoku-Chat-Partial', result.meta.partial === true);
+            setSafeHeader(res, 'X-Baibaoku-Chat-Total-Messages', result.meta.totalMessages || 0);
             res.json({
                 ok: true,
                 data: result,
@@ -3660,9 +3661,9 @@ export function registerStEndpoints(router, manager) {
 
             const result = await queueSettingsSave(userHandle, () => saveSettingsWithCache(req, userHandle));
 
-            res.set('X-Baibaoku-Elapsed-Ms', String(Date.now() - startedAt));
+            setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', Date.now() - startedAt);
             if (result.skipped) {
-                res.set('X-Baibaoku-Save-Skipped', 'true');
+                setSafeHeader(res, 'X-Baibaoku-Save-Skipped', true);
             }
             res.json(result);
             scheduleSettingsResponseWarmup(req, userHandle, result.skipped ? 'fast-save-skipped' : 'fast-save');
@@ -3701,8 +3702,8 @@ export function registerStEndpoints(router, manager) {
                 return res.status(404).json({ ok: false, error: true, message: 'Theme not found.' });
             }
 
-            res.set('X-Baibaoku-Elapsed-Ms', String(Date.now() - startedAt));
-            res.set('X-Baibaoku-Theme-File', encodeURIComponent(result.filename));
+            setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', Date.now() - startedAt);
+            setSafeHeader(res, 'X-Baibaoku-Theme-File', result.filename);
             res.json({
                 ok: true,
                 data: result.theme,
@@ -3792,16 +3793,16 @@ export function registerStEndpoints(router, manager) {
 
             res.type('application/json; charset=utf-8');
             res.set('Cache-Control', 'no-cache');
-            res.set('X-Baibaoku-Elapsed-Ms', String(metrics.totalMs));
-            res.set('X-Baibaoku-Settings-Cache', metrics.settingsCache);
-            res.set('X-Baibaoku-Payload-Cache', metrics.payloadCache);
-            res.set('X-Baibaoku-Payload-Theme-Mode', metrics.payloadThemeMode || SETTINGS_THEME_MODE_FULL);
+            setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', metrics.totalMs);
+            setSafeHeader(res, 'X-Baibaoku-Settings-Cache', metrics.settingsCache);
+            setSafeHeader(res, 'X-Baibaoku-Payload-Cache', metrics.payloadCache);
+            setSafeHeader(res, 'X-Baibaoku-Payload-Theme-Mode', metrics.payloadThemeMode || SETTINGS_THEME_MODE_FULL);
             if (metrics.payloadDirtyReason) {
-                res.set('X-Baibaoku-Payload-Dirty-Reason', metrics.payloadDirtyReason.slice(0, 512));
-                res.set('X-Baibaoku-Payload-Dirty-Age-Ms', String(metrics.payloadDirtyAgeMs || 0));
+                setSafeHeader(res, 'X-Baibaoku-Payload-Dirty-Reason', metrics.payloadDirtyReason, { maxSourceLength: 512 });
+                setSafeHeader(res, 'X-Baibaoku-Payload-Dirty-Age-Ms', metrics.payloadDirtyAgeMs || 0);
             }
-            res.set('X-Baibaoku-Response-Cache', metrics.responseCache);
-            res.set('X-Baibaoku-Response-Encoding', response.encoding);
+            setSafeHeader(res, 'X-Baibaoku-Response-Cache', metrics.responseCache);
+            setSafeHeader(res, 'X-Baibaoku-Response-Encoding', response.encoding);
             res.set('Server-Timing', [
                 `settings;dur=${metrics.settingsMs}`,
                 `payload;dur=${metrics.payloadMs}`,

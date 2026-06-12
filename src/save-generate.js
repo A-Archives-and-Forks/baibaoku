@@ -9,6 +9,7 @@ import { router as chatCompletionsRouter } from '../../../src/endpoints/backends
 import { CHAT_COMPLETION_SOURCES } from '../../../src/constants.js';
 import { tryParse } from '../../../src/util.js';
 import { loadSqliteDriver } from './database.js';
+import { setHeaderIfValid, setSafeHeader } from './header-utils.js';
 import { getStoragePaths } from './paths.js';
 
 const SAVE_GENERATE_JOB_TTL_MS = 2 * 24 * 60 * 60 * 1000;
@@ -29,7 +30,7 @@ export function registerSaveGenerateEndpoints(router) {
         try {
             const job = createSaveGenerateJob(req);
             const isStream = job.generate.stream === true;
-            res.set('X-Baibaoku-Save-Generate-Job-Id', job.id);
+            setSafeHeader(res, 'X-Baibaoku-Save-Generate-Job-Id', job.id);
 
             if (isStream) {
                 res.set('Cache-Control', 'no-cache');
@@ -443,13 +444,13 @@ function sendCapturedGenerateResponse(res, response, job) {
     }
 
     res.status(response.statusCode || 200);
-    res.set('X-Baibaoku-Save-Generate-Status', job.status);
+    setSafeHeader(res, 'X-Baibaoku-Save-Generate-Status', job.status);
 
     for (const [key, value] of Object.entries(response.headers || {})) {
         if (/^(content-length|transfer-encoding)$/i.test(key)) {
             continue;
         }
-        res.set(key, value);
+        setHeaderIfValid(res, key, value);
     }
 
     if (!res.get('content-type')) {
@@ -566,9 +567,9 @@ function copyCaptureHeadersToStream(streamResponse, capture) {
             continue;
         }
         try {
-            streamResponse.set(key, value);
+            setHeaderIfValid(streamResponse, key, value);
         } catch {
-            // Ignore invalid or late headers from the captured response.
+            // Ignore late headers from the captured response.
         }
     }
 }
