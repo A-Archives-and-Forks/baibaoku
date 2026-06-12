@@ -6,7 +6,7 @@ import sanitize from 'sanitize-filename';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { parse } from '../../../src/character-card-parser.js';
 import { PUBLIC_DIRECTORIES, SETTINGS_FILE } from '../../../src/constants.js';
-import { generateTimestamp, removeOldBackups } from '../../../src/util.js';
+import { generateTimestamp, getVersion, removeOldBackups } from '../../../src/util.js';
 import { PLUGIN_ID } from './constants.js';
 import {
     getTiktokenTokenizer,
@@ -34,6 +34,7 @@ const DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = false;
 const DEFAULT_TOKENIZER_BULK_COUNT_ENABLED = true;
 const DEFAULT_EXTENSION_MANIFEST_BUNDLE_ENABLED = true;
+const DEFAULT_VERSION_ACCELERATION_ENABLED = true;
 const SETTINGS_AUTOSAVE_INTERVAL = 10 * 60 * 1000;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
 const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
@@ -71,6 +72,8 @@ const lastBackupTexts = new Map();
 const tokenizerLoadPromises = new WeakMap();
 let staticSettingsPayload = null;
 const EARLY_BRIDGE_VERSION = '0.6';
+let fastVersionCache = null;
+let fastVersionPromise = null;
 
 /**
  * Normalizes tags from V1/V2 char data structure.
@@ -2395,6 +2398,7 @@ async function getSettingsFastConfig(req, manager) {
         progressiveChatLoadingEnabled: false,
         tokenizerBulkCountEnabled: value.tokenizerBulkCountEnabled !== false,
         extensionManifestBundleEnabled: value.extensionManifestBundleEnabled !== false,
+        versionAccelerationEnabled: value.versionAccelerationEnabled !== false,
     };
 }
 
@@ -2418,6 +2422,9 @@ async function setSettingsFastConfig(req, manager) {
         extensionManifestBundleEnabled: req.body?.extensionManifestBundleEnabled === undefined
             ? current.extensionManifestBundleEnabled !== false
             : req.body.extensionManifestBundleEnabled !== false,
+        versionAccelerationEnabled: req.body?.versionAccelerationEnabled === undefined
+            ? current.versionAccelerationEnabled !== false
+            : req.body.versionAccelerationEnabled !== false,
     };
 
     await manager.set(
@@ -2444,12 +2451,62 @@ async function getSettingsFastConfigSafe(req, manager) {
             progressiveChatLoadingEnabled: DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED,
             tokenizerBulkCountEnabled: DEFAULT_TOKENIZER_BULK_COUNT_ENABLED,
             extensionManifestBundleEnabled: DEFAULT_EXTENSION_MANIFEST_BUNDLE_ENABLED,
+            versionAccelerationEnabled: DEFAULT_VERSION_ACCELERATION_ENABLED,
         };
     }
 }
 
+async function getFastVersionPayload() {
+    if (fastVersionCache) {
+        return {
+            payload: fastVersionCache.payload,
+            source: 'hit',
+            cacheAgeMs: Date.now() - fastVersionCache.cachedAt,
+            sourceElapsedMs: fastVersionCache.sourceElapsedMs,
+        };
+    }
+
+    const source = fastVersionPromise ? 'pending' : 'miss';
+
+    if (!fastVersionPromise) {
+        const startedAt = Date.now();
+        fastVersionPromise = Promise.resolve()
+            .then(() => getVersion())
+            .then((payload) => {
+                if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+                    throw new Error('SillyTavern version payload is invalid.');
+                }
+
+                fastVersionCache = {
+                    payload,
+                    cachedAt: Date.now(),
+                    sourceElapsedMs: Date.now() - startedAt,
+                };
+                return fastVersionCache;
+            })
+            .finally(() => {
+                fastVersionPromise = null;
+            });
+    }
+
+    const cache = await fastVersionPromise;
+    return {
+        payload: cache.payload,
+        source,
+        cacheAgeMs: Date.now() - cache.cachedAt,
+        sourceElapsedMs: cache.sourceElapsedMs,
+    };
+}
+
+function warmFastVersionCache() {
+    getFastVersionPayload().catch((error) => {
+        console.warn('[baibaoku] Failed to prewarm fast-version cache:', error.message);
+    });
+}
+
 function makeEarlyBridgeScript(options = {}) {
     const apiPrefix = `/api/plugins/${PLUGIN_ID}`;
+    const fastVersionPath = `${apiPrefix}/v1/fast-version`;
     const fastSettingsGetPath = `${apiPrefix}/v1/settings/fast-get`;
     const fastSettingsSavePath = `${apiPrefix}/v1/settings/fast-save`;
     const fastThemeGetPath = `${apiPrefix}/v1/themes/get`;
@@ -2461,6 +2518,7 @@ function makeEarlyBridgeScript(options = {}) {
     const recentChatListAccelerationEnabled = options.recentChatListAccelerationEnabled !== false;
     const tokenizerBulkCountEnabled = options.tokenizerBulkCountEnabled !== false;
     const extensionManifestBundleEnabled = options.extensionManifestBundleEnabled !== false;
+    const versionAccelerationEnabled = options.versionAccelerationEnabled !== false;
 
     return `/* baibaoku early bridge v${EARLY_BRIDGE_VERSION} */
 (function () {
@@ -2468,6 +2526,7 @@ function makeEarlyBridgeScript(options = {}) {
 
   var FLAG = '__baibaokuEarlyBridge';
   var VERSION = ${JSON.stringify(String(EARLY_BRIDGE_VERSION))};
+  var FAST_VERSION = ${JSON.stringify(fastVersionPath)};
   var FAST_SETTINGS_GET = ${JSON.stringify(fastSettingsGetPath)};
   var FAST_SETTINGS_SAVE = ${JSON.stringify(fastSettingsSavePath)};
   var FAST_THEME_GET = ${JSON.stringify(fastThemeGetPath)};
@@ -2480,6 +2539,7 @@ function makeEarlyBridgeScript(options = {}) {
   var RECENT_CHAT_LIST_ACCELERATION_ENABLED = ${JSON.stringify(recentChatListAccelerationEnabled)};
   var TOKENIZER_BULK_COUNT_ENABLED = ${JSON.stringify(tokenizerBulkCountEnabled)};
   var EXTENSION_MANIFEST_BUNDLE_ENABLED = ${JSON.stringify(extensionManifestBundleEnabled)};
+  var VERSION_ACCELERATION_ENABLED = ${JSON.stringify(versionAccelerationEnabled)};
 
   if (window[FLAG] && window[FLAG].installed) {
     return;
@@ -2497,13 +2557,15 @@ function makeEarlyBridgeScript(options = {}) {
   state.installed = true;
   state.version = VERSION;
   state.installedAt = Date.now();
+  state.fastVersionPath = FAST_VERSION;
   state.fastGetPath = FAST_SETTINGS_GET;
   state.fastSavePath = FAST_SETTINGS_SAVE;
   state.fastThemeGetPath = FAST_THEME_GET;
   state.fastCharacterListPath = FAST_CHARACTER_LIST;
   state.fastRecentChatListPath = FAST_RECENT_CHAT_LIST;
   state.extensionManifestBundlePath = EXTENSION_MANIFEST_BUNDLE;
-  state.requests = state.requests || { get: 0, save: 0, themeGet: 0, characters: 0, recentChats: 0, extensionBundle: 0, extensionManifest: 0, extensionManifestRefresh: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
+  state.requests = state.requests || { version: 0, get: 0, save: 0, themeGet: 0, characters: 0, recentChats: 0, extensionBundle: 0, extensionManifest: 0, extensionManifestRefresh: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
+  if (typeof state.requests.version !== 'number') state.requests.version = 0;
   if (typeof state.requests.saveFrontendCache !== 'number') state.requests.saveFrontendCache = 0;
   if (typeof state.requests.themeGet !== 'number') state.requests.themeGet = 0;
   if (typeof state.requests.recentChats !== 'number') state.requests.recentChats = 0;
@@ -2593,6 +2655,17 @@ function makeEarlyBridgeScript(options = {}) {
   state.setExtensionManifestBundleEnabled = writeExtensionManifestBundleEnabled;
   state.extensionManifestBundleEnabled = EXTENSION_MANIFEST_BUNDLE_ENABLED;
 
+  function writeVersionAccelerationEnabled(enabled) {
+    state.versionAccelerationEnabled = Boolean(enabled);
+    return state.versionAccelerationEnabled;
+  }
+
+  state.isVersionAccelerationEnabled = function () {
+    return state.versionAccelerationEnabled !== false;
+  };
+  state.setVersionAccelerationEnabled = writeVersionAccelerationEnabled;
+  state.versionAccelerationEnabled = VERSION_ACCELERATION_ENABLED;
+
   function toUrl(input) {
     try {
       if (typeof input === 'string') return new URL(input, location.href);
@@ -2609,6 +2682,7 @@ function makeEarlyBridgeScript(options = {}) {
   function shouldIntercept(url, method) {
     if (!url || url.origin !== location.origin) return null;
     if (method === 'GET') {
+      if (url.pathname === '/version') return { kind: 'version', fastPath: FAST_VERSION };
       if (url.pathname === '/api/extensions/discover') return { kind: 'extensionDiscover', fastPath: EXTENSION_MANIFEST_BUNDLE };
       var manifestName = getManifestRequestName(url);
       if (manifestName) return { kind: 'extensionManifest', name: manifestName };
@@ -3199,6 +3273,9 @@ function makeEarlyBridgeScript(options = {}) {
     if (route.kind === 'extensionDiscover' || route.kind === 'extensionManifest') {
       return state.extensionManifestBundleEnabled !== false;
     }
+    if (route.kind === 'version') {
+      return state.versionAccelerationEnabled !== false;
+    }
     if (route.kind === 'characters') {
       if (state.characterListAccelerationEnabled === false) return false;
       return isPlainEmptyObject(await readJsonBody(input, init));
@@ -3467,6 +3544,8 @@ function guesstimateBulk(str) {
 
 export function closeStEndpointCaches() {
     closeSaveGenerateJobs();
+    fastVersionCache = null;
+    fastVersionPromise = null;
 
     for (const userCache of settingsUserCaches.values()) {
         for (const watcher of userCache.payloadWatchers?.values() || []) {
@@ -3490,6 +3569,7 @@ export function closeStEndpointCaches() {
 
 export function registerStEndpoints(router, manager) {
     registerSaveGenerateEndpoints(router);
+    warmFastVersionCache();
 
     router.get('/v1/extensions/manifest-bundle', (req, res) => {
         try {
@@ -3497,6 +3577,20 @@ export function registerStEndpoints(router, manager) {
             res.json(buildExtensionManifestBundle(req));
         } catch (error) {
             console.error('[baibaoku] Error in extension manifest bundle endpoint:', error);
+            res.status(500).json({ error: true, message: error.message });
+        }
+    });
+
+    router.get('/v1/fast-version', async (req, res) => {
+        try {
+            const result = await getFastVersionPayload();
+            res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+            setSafeHeader(res, 'X-Baibaoku-Version-Cache', result.source);
+            setSafeHeader(res, 'X-Baibaoku-Version-Cache-Age-Ms', result.cacheAgeMs);
+            setSafeHeader(res, 'X-Baibaoku-Version-Source-Elapsed-Ms', result.sourceElapsedMs);
+            res.json(result.payload);
+        } catch (error) {
+            console.error('[baibaoku] Error in fast-version endpoint:', error);
             res.status(500).json({ error: true, message: error.message });
         }
     });
