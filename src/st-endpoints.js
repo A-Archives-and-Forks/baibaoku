@@ -2679,6 +2679,72 @@ function makeEarlyBridgeScript(options = {}) {
     return String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
   }
 
+  function isLocalOrPrivateHost(hostname) {
+    var host = normalizeHostname(hostname);
+
+    if (!host) return false;
+    if (host === 'localhost' || host.endsWith('.localhost')) return true;
+
+    var ipv4Parts = parseIpv4Address(host);
+    if (ipv4Parts) return isLocalOrPrivateIpv4(ipv4Parts);
+
+    return isLocalOrPrivateIpv6(host);
+  }
+
+  function normalizeHostname(hostname) {
+    return String(hostname || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^\\[|\\]$/g, '')
+      .replace(/\\.+$/g, '');
+  }
+
+  function parseIpv4Address(host) {
+    var parts = host.split('.');
+
+    if (parts.length !== 4) return null;
+
+    var octets = [];
+    for (var i = 0; i < parts.length; i += 1) {
+      if (!/^\\d{1,3}$/.test(parts[i])) return null;
+
+      var value = Number(parts[i]);
+      if (!Number.isInteger(value) || value < 0 || value > 255) return null;
+
+      octets.push(value);
+    }
+
+    return octets;
+  }
+
+  function isLocalOrPrivateIpv4(parts) {
+    var first = parts[0];
+    var second = parts[1];
+    return first === 0
+      || first === 10
+      || first === 127
+      || (first === 169 && second === 254)
+      || (first === 172 && second >= 16 && second <= 31)
+      || (first === 192 && second === 168);
+  }
+
+  function isLocalOrPrivateIpv6(host) {
+    if (!host.includes(':')) return false;
+    if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
+
+    if (host.startsWith('::ffff:')) {
+      var ipv4Parts = parseIpv4Address(host.slice(7));
+      return ipv4Parts ? isLocalOrPrivateIpv4(ipv4Parts) : false;
+    }
+
+    var firstGroup = host.split(':')[0];
+    if (!/^[0-9a-f]{1,4}$/.test(firstGroup)) return false;
+
+    var firstValue = parseInt(firstGroup, 16);
+    return (firstValue & 0xfe00) === 0xfc00
+      || (firstValue & 0xffc0) === 0xfe80;
+  }
+
   function shouldIntercept(url, method) {
     if (!url || url.origin !== location.origin) return null;
     if (method === 'GET') {
@@ -3184,14 +3250,6 @@ function makeEarlyBridgeScript(options = {}) {
     }
   }
 
-  function parseJsonResult(text) {
-    try {
-      return { ok: true, value: JSON.parse(text) };
-    } catch (_) {
-      return { ok: false, value: null };
-    }
-  }
-
   async function bodyToText(body) {
     if (body === undefined || body === null) return '';
     if (typeof body === 'string') return body;
@@ -3202,16 +3260,24 @@ function makeEarlyBridgeScript(options = {}) {
     return null;
   }
 
+  function hashStringForSaveKey(text) {
+    var hash = 2166136261;
+    for (var i = 0; i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
   async function getSettingsSaveKey(body) {
     var text = await bodyToText(body);
     if (text === null) return null;
-    var parsed = parseJsonResult(text || '{}');
-    if (!parsed.ok) return null;
-    return JSON.stringify(parsed.value == null ? {} : parsed.value, null, 4);
+    return String(text.length) + ':' + hashStringForSaveKey(text);
   }
 
   async function gzipFastSaveInit(init) {
     var headers = new Headers(init.headers || undefined);
+    if (isLocalOrPrivateHost(location.hostname)) return init;
     if (headers.has('content-encoding')) return init;
     if (typeof CompressionStream !== 'function') return init;
 
