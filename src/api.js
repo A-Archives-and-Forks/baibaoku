@@ -20,6 +20,13 @@ import {
     normalizeSetManyEntries,
 } from './validate.js';
 import { registerStEndpoints } from './st-endpoints.js';
+import {
+    deletePresetBackup,
+    downloadPresetBackup,
+    listPresetBackups,
+    renamePresetBackup,
+    savePresetBackup,
+} from './preset-backups.js';
 
 export function registerApi(router, manager) {
     registerStEndpoints(router, manager);
@@ -35,6 +42,26 @@ export function registerApi(router, manager) {
     router.get('/v1/client.js', route(async (req, res) => {
         res.type('application/javascript; charset=utf-8');
         res.send(CLIENT_SCRIPT);
+    }));
+
+    router.post('/v1/preset-backups/save', route(async (req, res) => {
+        sendOk(res, await savePresetBackup(req));
+    }));
+
+    router.post('/v1/preset-backups/save/list', route(async (req, res) => {
+        sendOk(res, await listPresetBackups(req));
+    }));
+
+    router.post('/v1/preset-backups/save/rename', route(async (req, res) => {
+        sendOk(res, await renamePresetBackup(req));
+    }));
+
+    router.post('/v1/preset-backups/save/delete', route(async (req, res) => {
+        sendOk(res, await deletePresetBackup(req));
+    }));
+
+    router.post('/v1/preset-backups/download', route(async (req, res) => {
+        sendOk(res, await downloadPresetBackup(req));
     }));
 
     router.post('/v1/open', route(async (req, res) => {
