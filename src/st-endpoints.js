@@ -29,6 +29,7 @@ const SETTINGS_FAST_CONFIG_DATABASE = 'baibaoku.internal';
 const SETTINGS_FAST_CONFIG_STORE = 'fast-config';
 const SETTINGS_FAST_CONFIG_KEY = 'global';
 const DEFAULT_SETTINGS_ACCELERATION_ENABLED = true;
+const DEFAULT_LAZY_THEME_LOADING_ENABLED = true;
 const DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED = true;
 const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = false;
@@ -71,7 +72,7 @@ const settingsBackupSchedulers = new Map();
 const lastBackupTexts = new Map();
 const tokenizerLoadPromises = new WeakMap();
 let staticSettingsPayload = null;
-const EARLY_BRIDGE_VERSION = '0.6';
+const EARLY_BRIDGE_VERSION = '0.7';
 let fastVersionCache = null;
 let fastVersionPromise = null;
 
@@ -2391,8 +2392,12 @@ async function getSettingsFastConfig(req, manager) {
             : {};
     }
 
+    const settingsAccelerationEnabled = value.settingsAccelerationEnabled !== false;
+    const lazyThemeLoadingEnabled = settingsAccelerationEnabled && value.lazyThemeLoadingEnabled !== false;
+
     return {
-        settingsAccelerationEnabled: value.settingsAccelerationEnabled !== false,
+        settingsAccelerationEnabled,
+        lazyThemeLoadingEnabled,
         characterListAccelerationEnabled: value.characterListAccelerationEnabled !== false,
         recentChatListAccelerationEnabled: value.recentChatListAccelerationEnabled !== false,
         progressiveChatLoadingEnabled: false,
@@ -2404,11 +2409,20 @@ async function getSettingsFastConfig(req, manager) {
 
 async function setSettingsFastConfig(req, manager) {
     const current = await getSettingsFastConfig(req, manager);
+    const requestedLazyThemeLoadingEnabled = req.body?.lazyThemeLoadingEnabled === undefined
+        ? current.lazyThemeLoadingEnabled !== false
+        : req.body.lazyThemeLoadingEnabled !== false;
+    const requestedSettingsAccelerationEnabled = req.body?.settingsAccelerationEnabled === undefined
+        ? current.settingsAccelerationEnabled !== false
+        : req.body.settingsAccelerationEnabled !== false;
+    const settingsAccelerationEnabled = requestedLazyThemeLoadingEnabled
+        ? true
+        : requestedSettingsAccelerationEnabled;
+
     const next = {
         ...current,
-        settingsAccelerationEnabled: req.body?.settingsAccelerationEnabled === undefined
-            ? current.settingsAccelerationEnabled !== false
-            : req.body.settingsAccelerationEnabled !== false,
+        settingsAccelerationEnabled,
+        lazyThemeLoadingEnabled: settingsAccelerationEnabled && requestedLazyThemeLoadingEnabled,
         characterListAccelerationEnabled: req.body?.characterListAccelerationEnabled === undefined
             ? current.characterListAccelerationEnabled !== false
             : req.body.characterListAccelerationEnabled !== false,
@@ -2446,6 +2460,7 @@ async function getSettingsFastConfigSafe(req, manager) {
         console.warn('[baibaoku] Failed to read settings fast config; using defaults:', error.message);
         return {
             settingsAccelerationEnabled: DEFAULT_SETTINGS_ACCELERATION_ENABLED,
+            lazyThemeLoadingEnabled: DEFAULT_LAZY_THEME_LOADING_ENABLED,
             characterListAccelerationEnabled: DEFAULT_CHARACTER_LIST_ACCELERATION_ENABLED,
             recentChatListAccelerationEnabled: DEFAULT_RECENT_CHAT_LIST_ACCELERATION_ENABLED,
             progressiveChatLoadingEnabled: DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED,
@@ -2514,6 +2529,7 @@ function makeEarlyBridgeScript(options = {}) {
     const fastRecentChatListPath = `${apiPrefix}/v1/chats/fast-recent`;
     const extensionManifestBundlePath = `${apiPrefix}/v1/extensions/manifest-bundle`;
     const settingsAccelerationEnabled = options.settingsAccelerationEnabled !== false;
+    const lazyThemeLoadingEnabled = settingsAccelerationEnabled && options.lazyThemeLoadingEnabled !== false;
     const characterListAccelerationEnabled = options.characterListAccelerationEnabled !== false;
     const recentChatListAccelerationEnabled = options.recentChatListAccelerationEnabled !== false;
     const tokenizerBulkCountEnabled = options.tokenizerBulkCountEnabled !== false;
@@ -2535,6 +2551,7 @@ function makeEarlyBridgeScript(options = {}) {
   var EXTENSION_MANIFEST_BUNDLE = ${JSON.stringify(extensionManifestBundlePath)};
   var LAZY_THEME_MARKER = ${JSON.stringify(SETTINGS_LAZY_THEME_MARKER)};
   var SETTINGS_ACCELERATION_ENABLED = ${JSON.stringify(settingsAccelerationEnabled)};
+  var LAZY_THEME_LOADING_ENABLED = ${JSON.stringify(lazyThemeLoadingEnabled)};
   var CHARACTER_LIST_ACCELERATION_ENABLED = ${JSON.stringify(characterListAccelerationEnabled)};
   var RECENT_CHAT_LIST_ACCELERATION_ENABLED = ${JSON.stringify(recentChatListAccelerationEnabled)};
   var TOKENIZER_BULK_COUNT_ENABLED = ${JSON.stringify(tokenizerBulkCountEnabled)};
@@ -2599,6 +2616,7 @@ function makeEarlyBridgeScript(options = {}) {
     var next = Boolean(enabled);
     state.settingsAccelerationEnabled = next;
     if (!next) {
+      state.lazyThemeLoadingEnabled = false;
       clearSettingsGetCache('settings-acceleration-disabled');
     }
     return next;
@@ -2609,6 +2627,23 @@ function makeEarlyBridgeScript(options = {}) {
   };
   state.setSettingsAccelerationEnabled = writeSettingsAccelerationEnabled;
   state.settingsAccelerationEnabled = SETTINGS_ACCELERATION_ENABLED;
+
+  function writeLazyThemeLoadingEnabled(enabled) {
+    var next = Boolean(enabled);
+    state.lazyThemeLoadingEnabled = next;
+    if (next) {
+      writeSettingsAccelerationEnabled(true);
+    } else {
+      clearSettingsGetCache('lazy-theme-loading-disabled');
+    }
+    return next;
+  }
+
+  state.isLazyThemeLoadingEnabled = function () {
+    return state.settingsAccelerationEnabled !== false && state.lazyThemeLoadingEnabled !== false;
+  };
+  state.setLazyThemeLoadingEnabled = writeLazyThemeLoadingEnabled;
+  state.lazyThemeLoadingEnabled = LAZY_THEME_LOADING_ENABLED;
 
   function writeCharacterListAccelerationEnabled(enabled) {
     state.characterListAccelerationEnabled = Boolean(enabled);
@@ -2853,7 +2888,9 @@ function makeEarlyBridgeScript(options = {}) {
     var headers = getPluginJsonHeaders();
     if (!headers.get('x-csrf-token')) return null;
 
-    headers.set('x-baibaoku-lazy-themes', '1');
+    if (state.lazyThemeLoadingEnabled !== false) {
+      headers.set('x-baibaoku-lazy-themes', '1');
+    }
     var cacheVersion = state.settingsGetCacheVersion;
     state.requests.settingsPrefetch += 1;
     state.lastSettingsGetPrefetchReason = reason || 'unknown';
@@ -3509,7 +3546,9 @@ function makeEarlyBridgeScript(options = {}) {
       var fastInit = await makeFastInit(input, init, method);
 
       if (route.kind === 'get') {
-        fastInit.headers.set('x-baibaoku-lazy-themes', '1');
+        if (state.lazyThemeLoadingEnabled !== false) {
+          fastInit.headers.set('x-baibaoku-lazy-themes', '1');
+        }
         rememberSettingsRequestHeaders(fastInit.headers);
       }
 
