@@ -2564,7 +2564,7 @@ function makeEarlyBridgeScript(options = {}) {
   state.fastCharacterListPath = FAST_CHARACTER_LIST;
   state.fastRecentChatListPath = FAST_RECENT_CHAT_LIST;
   state.extensionManifestBundlePath = EXTENSION_MANIFEST_BUNDLE;
-  state.requests = state.requests || { version: 0, get: 0, save: 0, themeGet: 0, characters: 0, recentChats: 0, extensionBundle: 0, extensionManifest: 0, extensionManifestRefresh: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
+  state.requests = state.requests || { version: 0, get: 0, save: 0, themeGet: 0, characters: 0, recentChats: 0, extensionBundle: 0, extensionManifest: 0, extensionManifestRefresh: 0, settingsPrefetch: 0, fallback: 0, errors: 0, frontendCache: 0, invalidations: 0, saveFrontendCache: 0 };
   if (typeof state.requests.version !== 'number') state.requests.version = 0;
   if (typeof state.requests.saveFrontendCache !== 'number') state.requests.saveFrontendCache = 0;
   if (typeof state.requests.themeGet !== 'number') state.requests.themeGet = 0;
@@ -2572,9 +2572,11 @@ function makeEarlyBridgeScript(options = {}) {
   if (typeof state.requests.extensionBundle !== 'number') state.requests.extensionBundle = 0;
   if (typeof state.requests.extensionManifest !== 'number') state.requests.extensionManifest = 0;
   if (typeof state.requests.extensionManifestRefresh !== 'number') state.requests.extensionManifestRefresh = 0;
+  if (typeof state.requests.settingsPrefetch !== 'number') state.requests.settingsPrefetch = 0;
   state.rawFetch = rawFetch;
   state.settingsGetCache = state.settingsGetCache || null;
   state.settingsGetPending = null;
+  state.settingsGetCacheVersion = typeof state.settingsGetCacheVersion === 'number' ? state.settingsGetCacheVersion : 0;
   state.settingsSaveCache = state.settingsSaveCache || null;
   state.settingsSavePending = null;
   state.settingsRequestHeaders = state.settingsRequestHeaders || null;
@@ -2790,6 +2792,7 @@ function makeEarlyBridgeScript(options = {}) {
     if (state.settingsGetCache || state.settingsGetPending) {
       state.requests.invalidations += 1;
     }
+    state.settingsGetCacheVersion += 1;
     state.settingsGetCache = null;
     state.settingsGetPending = null;
     state.lazyThemesArray = null;
@@ -2841,6 +2844,62 @@ function makeEarlyBridgeScript(options = {}) {
     } catch (_) {}
     headers.set('content-type', 'application/json');
     return headers;
+  }
+
+  function startSettingsGetPrefetch(reason) {
+    if (state.settingsAccelerationEnabled === false) return null;
+    if (state.settingsGetCache || state.settingsGetPending) return state.settingsGetPending;
+
+    var headers = getPluginJsonHeaders();
+    if (!headers.get('x-csrf-token')) return null;
+
+    headers.set('x-baibaoku-lazy-themes', '1');
+    var cacheVersion = state.settingsGetCacheVersion;
+    state.requests.settingsPrefetch += 1;
+    state.lastSettingsGetPrefetchReason = reason || 'unknown';
+    state.lastSettingsGetPrefetchStartedAt = Date.now();
+
+    var pending = rawFetch(FAST_SETTINGS_GET, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: headers,
+      body: '{}',
+    }).then(function (response) {
+      if (!response || !response.ok) {
+        throw new Error('Settings prefetch failed: ' + (response ? response.status : 'no response'));
+      }
+      return cacheSettingsGetResponse(response, cacheVersion);
+    }).then(function (cache) {
+      if (cache) {
+        state.lastSettingsGetPrefetchFinishedAt = Date.now();
+      }
+      return cache;
+    }).catch(function (error) {
+      state.requests.errors += 1;
+      state.lastSettingsGetPrefetchError = error && error.message ? error.message : String(error);
+      return null;
+    }).finally(function () {
+      if (state.settingsGetPending === pending) {
+        state.settingsGetPending = null;
+      }
+    });
+
+    state.settingsGetPending = pending;
+    return pending;
+  }
+
+  state.prefetchSettingsGet = startSettingsGetPrefetch;
+
+  async function handleCsrfTokenResponse(response) {
+    var payload = await response.json().catch(function () { return null; });
+    var token = payload && typeof payload.token === 'string' ? payload.token : '';
+    if (!token) return null;
+
+    rememberSettingsRequestHeaders({
+      'content-type': 'application/json',
+      'x-csrf-token': token,
+    });
+    return startSettingsGetPrefetch('csrf-token');
   }
 
   function getSettingsThemeNameFromPayload(data) {
@@ -3191,7 +3250,7 @@ function makeEarlyBridgeScript(options = {}) {
     await refreshCachedExtensionManifest(name);
   }
 
-  async function cacheSettingsGetResponse(response) {
+  async function cacheSettingsGetResponse(response, cacheVersion) {
     var text = await response.clone().text();
     var headers = {};
     response.headers.forEach(function (value, key) {
@@ -3199,13 +3258,22 @@ function makeEarlyBridgeScript(options = {}) {
         headers[key] = value;
       }
     });
-    state.settingsGetCache = {
+    var cache = {
       text: text,
       headers: headers,
       status: response.status,
       statusText: response.statusText,
       savedAt: Date.now(),
     };
+
+    if (typeof cacheVersion === 'number' && cacheVersion !== state.settingsGetCacheVersion) {
+      state.lastStaleSettingsGetCacheAt = Date.now();
+      state.lastStaleSettingsGetCacheVersion = cacheVersion;
+      state.lastStaleSettingsGetCurrentVersion = state.settingsGetCacheVersion;
+      return null;
+    }
+
+    state.settingsGetCache = cache;
     return state.settingsGetCache;
   }
 
@@ -3392,6 +3460,12 @@ function makeEarlyBridgeScript(options = {}) {
 
     if (!await shouldUseFastRoute(route, input, init)) {
       var originalResponse = await rawFetch(input, init);
+      if (originalResponse && originalResponse.ok && url && url.origin === location.origin && method === 'GET' && url.pathname === '/csrf-token') {
+        void handleCsrfTokenResponse(originalResponse.clone()).catch(function (error) {
+          state.requests.errors += 1;
+          state.lastSettingsGetPrefetchError = error && error.message ? error.message : String(error);
+        });
+      }
       try {
         await refreshExtensionManifestCacheAfterMutation(url, input, init, originalResponse);
       } catch (error) {
@@ -3426,7 +3500,9 @@ function makeEarlyBridgeScript(options = {}) {
         if (state.settingsGetPending) {
           state.requests.frontendCache += 1;
           var pendingCache = await state.settingsGetPending;
-          return makeCachedSettingsGetResponse(pendingCache, 'pending');
+          if (pendingCache) {
+            return makeCachedSettingsGetResponse(pendingCache, 'pending');
+          }
         }
       }
 
@@ -3487,7 +3563,8 @@ function makeEarlyBridgeScript(options = {}) {
       var response = await rawFetch(route.fastPath, fastInit);
       if (response && response.ok) {
         if (route.kind === 'get') {
-          state.settingsGetPending = cacheSettingsGetResponse(response)
+          var settingsGetCacheVersion = state.settingsGetCacheVersion;
+          state.settingsGetPending = cacheSettingsGetResponse(response, settingsGetCacheVersion)
             .catch(function (error) {
               state.requests.errors += 1;
               state.lastCacheError = error && error.message ? error.message : String(error);
@@ -3498,6 +3575,9 @@ function makeEarlyBridgeScript(options = {}) {
               state.settingsGetPending = null;
             });
           var settingsGetCache = await state.settingsGetPending;
+          if (!settingsGetCache) {
+            return callOriginal(input, init);
+          }
           return makeCachedSettingsGetResponse(settingsGetCache, 'miss');
         } else if (route.kind === 'characters') {
           var characterData = await response.clone().json().catch(function () { return null; });
