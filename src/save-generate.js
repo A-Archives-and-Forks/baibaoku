@@ -76,6 +76,17 @@ export function registerSaveGenerateEndpoints(router) {
         }
     });
 
+    router.post('/v1/chats/save-generate/discard', async (req, res) => {
+        try {
+            res.json({
+                ok: true,
+                data: await discardSaveGenerateJobsForRequest(req, req.body?.chatId || req.body?.chat_id),
+            });
+        } catch (error) {
+            res.status(error.status || 500).json({ ok: false, error: true, message: error.message });
+        }
+    });
+
     router.post('/v1/chats/save-generate/:jobId/cancel', async (req, res) => {
         try {
             res.json({
@@ -1494,6 +1505,83 @@ async function cancelSaveGenerateJobForRequest(req, jobId, chatId = '') {
     return serializeSaveGenerateJob(job);
 }
 
+async function discardSaveGenerateJobsForRequest(req, chatId = '') {
+    cleanupSaveGenerateJobs();
+
+    const userHandle = req.user?.profile?.handle;
+    if (!userHandle) {
+        throwHttpError('Unauthorized', 401);
+    }
+
+    const normalizedChatId = normalizeChatId(chatId);
+    if (!normalizedChatId) {
+        throwHttpError('chatId is required', 400);
+    }
+
+    const now = Date.now();
+    let memoryDiscarded = 0;
+    for (const [id, job] of saveGenerateJobs.entries()) {
+        if (!job || job.userHandle !== userHandle) {
+            continue;
+        }
+
+        const jobChatId = normalizeChatId(job.save?.chatId || job.save?.file_name);
+        if (jobChatId !== normalizedChatId) {
+            continue;
+        }
+
+        discardSaveGenerateJobInMemory(job, now);
+        saveGenerateJobs.delete(id);
+        memoryDiscarded += 1;
+    }
+
+    let persistedDiscarded = 0;
+    try {
+        await ensureSaveGeneratePersistenceReady(req);
+        const db = await getSaveGenerateDb(req);
+        const result = db.prepare(`
+            DELETE FROM save_generate_jobs
+            WHERE user_handle = ?
+              AND chat_id = ?
+        `).run(userHandle, normalizedChatId);
+        persistedDiscarded = Number(result?.changes || 0);
+    } catch (error) {
+        console.warn('[baibaoku] Failed to discard persisted save-generate jobs:', error.message);
+        throw error;
+    }
+
+    return {
+        chatId: normalizedChatId,
+        discarded: memoryDiscarded + persistedDiscarded,
+        memoryDiscarded,
+        persistedDiscarded,
+    };
+}
+
+function discardSaveGenerateJobInMemory(job, now = Date.now()) {
+    if (!job) {
+        return;
+    }
+
+    job.discardRequested = true;
+    job.cancelRequested = true;
+    job.canceledAt = job.canceledAt || now;
+    touchSaveGenerateJob(job, {
+        status: 'canceled',
+        finishedAt: now,
+        generateFinishedAt: job.generateFinishedAt || now,
+        resultText: '',
+        reasoning: '',
+        savedMessage: null,
+        savedMessageFloor: null,
+        error: {
+            message: 'Generation discarded because chat messages changed',
+            status: 499,
+        },
+    });
+    closeSaveGenerateJobSockets(job);
+}
+
 function findSaveGenerateJobToCancel(userHandle, jobId, chatId = '') {
     const id = String(jobId || '');
     if (id) {
@@ -1711,7 +1799,9 @@ async function cancelSaveGenerateJob(job) {
             status: 499,
         },
     });
-    await persistSaveGenerateJob(job);
+    if (!job.discardRequested) {
+        await persistSaveGenerateJob(job);
+    }
 }
 
 function closeSaveGenerateJobSockets(job) {
