@@ -6,7 +6,7 @@ import sanitize from 'sanitize-filename';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { parse } from '../../../src/character-card-parser.js';
 import { PUBLIC_DIRECTORIES, SETTINGS_FILE } from '../../../src/constants.js';
-import { generateTimestamp, getVersion, removeOldBackups } from '../../../src/util.js';
+import { generateTimestamp, getVersion, removeOldBackups, humanizedDateTime } from '../../../src/util.js';
 import { PLUGIN_ID } from './constants.js';
 import {
     getTiktokenTokenizer,
@@ -88,9 +88,77 @@ function extractTags(data) {
 }
 
 /**
- * Formats a character exactly like ST's `toShallow`
+ * Calculate chat statistics for a character
  */
-function formatShallowCharacter(filename, stat, rawDataStr) {
+async function calculateCharacterChatStats(chatsDir, filename, cachedStats) {
+    const charDirName = filename.replace('.png', '');
+    const charChatDir = path.join(chatsDir, charDirName);
+
+    let chatSize = 0;
+    let dateLastChat = 0;
+    let chatDirStat = null;
+
+    // Try to get chat directory stats
+    try {
+        chatDirStat = await fs.promises.stat(charChatDir);
+    } catch (e) {
+        if (e.code === 'ENOENT') {
+            // No chat directory exists for this character
+            return {
+                chatSize: 0,
+                dateLastChat: 0,
+                chatDirMtime: 0,
+                files: {},
+            };
+        }
+        throw e;
+    }
+
+    // Fast path: if directory mtime hasn't changed, use cached stats
+    if (cachedStats?.chatDirMtime === chatDirStat.mtimeMs && cachedStats.files) {
+        return cachedStats;
+    }
+
+    // Directory changed, need to check files
+    const files = await fs.promises.readdir(charChatDir);
+    const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
+    const fileStats = {};
+    const cachedFiles = cachedStats?.files || {};
+
+    // Check each file
+    for (const file of jsonlFiles) {
+        const filePath = path.join(charChatDir, file);
+        const stat = await fs.promises.stat(filePath);
+        const cached = cachedFiles[file];
+
+        // Use cached data if file hasn't changed
+        if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
+            fileStats[file] = cached;
+            chatSize += cached.size;
+            dateLastChat = Math.max(dateLastChat, cached.mtime);
+        } else {
+            // File is new or changed
+            fileStats[file] = {
+                size: stat.size,
+                mtime: stat.mtimeMs,
+            };
+            chatSize += stat.size;
+            dateLastChat = Math.max(dateLastChat, stat.mtimeMs);
+        }
+    }
+
+    return {
+        chatSize,
+        dateLastChat,
+        chatDirMtime: chatDirStat.mtimeMs,
+        files: fileStats,
+    };
+}
+
+/**
+ * Formats a character exactly like ST's `toShallow`, with real chat stats
+ */
+async function formatShallowCharacter(filename, stat, rawDataStr, chatsDir, cachedChatStats) {
     let charData = {};
     try {
         charData = JSON.parse(rawDataStr);
@@ -98,12 +166,8 @@ function formatShallowCharacter(filename, stat, rawDataStr) {
         console.warn(`[baibaoku] Failed to parse JSON for character card: ${filename}`);
     }
 
-    // Default prefix is usually stripped from avatars in ST core UI 
-    // Wait, the core ST removes "default_" when resolving files, but avatar usually keeps its filename
-    // Oh, wait, the user specifically mentioned:
-    // "酒馆默认角色卡是有default_前缀的,但是后端发回来的响应数据是没有这个前缀的,这个也要统一一下"
     let name = charData?.data?.name || charData?.name || filename.replace('.png', '');
-    
+
     if (filename.startsWith('default_')) {
         const filenameBase = filename.replace('.png', '');
         if (name === filenameBase || name.startsWith('default_')) {
@@ -111,16 +175,22 @@ function formatShallowCharacter(filename, stat, rawDataStr) {
         }
     }
 
+    // Get real chat statistics
+    const chatStats = await calculateCharacterChatStats(chatsDir, filename, cachedChatStats);
+
+    // Use chat field from character data, or generate default
+    const chatField = charData?.chat || `${name} - ${humanizedDateTime()}`;
+
     return {
         shallow: true,
         name: name,
         avatar: filename,
-        chat: `${name} - ${new Date().toISOString()}`, // mock
+        chat: chatField,
         fav: charData?.data?.extensions?.fav || charData?.fav || false,
         date_added: stat.ctimeMs,
         create_date: charData?.create_date || new Date(Math.round(stat.ctimeMs)).toISOString(),
-        date_last_chat: 0,
-        chat_size: 0,
+        date_last_chat: chatStats.dateLastChat,
+        chat_size: chatStats.chatSize,
         data_size: rawDataStr.length,
         tags: extractTags(charData),
         data: {
@@ -134,6 +204,8 @@ function formatShallowCharacter(filename, stat, rawDataStr) {
                 world: charData?.data?.extensions?.world || '',
             },
         },
+        // Internal: store chat stats for future incremental updates
+        _chatStats: chatStats,
     };
 }
 
@@ -143,75 +215,157 @@ async function updateCacheForUser(req, manager, userHandle, charactersDir) {
         userCaches.set(userHandle, await loadPersistentCache(req, manager));
     }
     const cache = userCaches.get(userHandle);
+    const chatsDir = req.user?.directories?.chats;
 
-    // 2. Read all files in the directory
-    let files = [];
+    // 2. Fast path: check if directories have changed via mtime
+    let charactersDirStat = null;
+    let chatsDirStat = null;
+
     try {
-        files = await fs.promises.readdir(charactersDir);
+        charactersDirStat = await fs.promises.stat(charactersDir);
     } catch (e) {
-        if (e.code === 'ENOENT') return cache; // Directory doesn't exist yet
+        if (e.code === 'ENOENT') return cache;
         throw e;
     }
-    const pngFiles = files.filter(f => f.endsWith('.png'));
 
-    // 3. Batch stat all png files to get mtime
-    const statPromises = pngFiles.map(async (filename) => {
+    if (chatsDir) {
         try {
-            const stat = await fs.promises.stat(path.join(charactersDir, filename));
-            return { filename, stat };
+            chatsDirStat = await fs.promises.stat(chatsDir);
         } catch (e) {
-            return { filename, error: e };
-        }
-    });
-    const statResults = await Promise.all(statPromises);
-
-    // 4. Garbage Collection: Remove deleted files from cache
-    const currentFileSet = new Set(pngFiles);
-    const deletedFilenames = [];
-    for (const cachedFilename of cache.keys()) {
-        if (!currentFileSet.has(cachedFilename)) {
-            cache.delete(cachedFilename);
-            deletedFilenames.push(cachedFilename);
+            // chats directory doesn't exist, treat as mtime 0
+            chatsDirStat = { mtimeMs: 0 };
         }
     }
 
-    // 5. Identify and parse changed/new files
-    const parsePromises = [];
+    const charactersChanged = cache.charactersDirMtime !== charactersDirStat.mtimeMs;
+    const chatsChanged = chatsDir && cache.chatsDirMtime !== (chatsDirStat?.mtimeMs || 0);
+
+    // If both directories haven't changed, return cached data immediately
+    if (!charactersChanged && !chatsChanged) {
+        return cache;
+    }
+
     const updatedItems = [];
-    for (const result of statResults) {
-        if (result.error) continue;
+    const deletedFilenames = [];
 
-        const { filename, stat } = result;
-        const cachedItem = cache.get(filename);
+    // 3. Handle characters directory changes
+    if (charactersChanged) {
+        let files = [];
+        try {
+            files = await fs.promises.readdir(charactersDir);
+        } catch (e) {
+            if (e.code === 'ENOENT') return cache;
+            throw e;
+        }
+        const pngFiles = files.filter(f => f.endsWith('.png'));
 
-        // If not in cache, or file metadata differs from the persisted snapshot.
-        if (!cachedItem || stat.mtimeMs !== cachedItem.mtime || stat.size !== cachedItem.size) {
-            const filePath = path.join(charactersDir, filename);
-            const parseTask = async () => {
+        // Batch stat all png files to get mtime
+        const statPromises = pngFiles.map(async (filename) => {
+            try {
+                const stat = await fs.promises.stat(path.join(charactersDir, filename));
+                return { filename, stat };
+            } catch (e) {
+                return { filename, error: e };
+            }
+        });
+        const statResults = await Promise.all(statPromises);
+
+        // Garbage Collection: Remove deleted files from cache
+        const currentFileSet = new Set(pngFiles);
+        for (const cachedFilename of cache.keys()) {
+            if (!currentFileSet.has(cachedFilename)) {
+                cache.delete(cachedFilename);
+                deletedFilenames.push(cachedFilename);
+            }
+        }
+
+        // Parse changed/new files
+        const parsePromises = [];
+        for (const result of statResults) {
+            if (result.error) continue;
+
+            const { filename, stat } = result;
+            const cachedItem = cache.get(filename);
+
+            // If not in cache, or file metadata differs
+            if (!cachedItem || stat.mtimeMs !== cachedItem.mtime || stat.size !== cachedItem.size) {
+                const filePath = path.join(charactersDir, filename);
+                const parseTask = async () => {
+                    try {
+                        const rawDataStr = await parse(filePath, 'png');
+                        if (rawDataStr) {
+                            const shallowData = await formatShallowCharacter(filename, stat, rawDataStr, chatsDir, cachedItem?.data?._chatStats);
+                            const item = {
+                                mtime: stat.mtimeMs,
+                                size: stat.size,
+                                data: shallowData,
+                            };
+                            cache.set(filename, item);
+                            updatedItems.push({ filename, item });
+                        }
+                    } catch (e) {
+                        console.warn(`[baibaoku] Failed to parse character ${filename}:`, e.message);
+                    }
+                };
+                parsePromises.push(parseTask());
+            }
+        }
+
+        await Promise.all(parsePromises);
+    }
+
+    // 4. Handle chats directory changes (independent of characters)
+    if (chatsChanged) {
+        let chatSubDirs = [];
+        try {
+            chatSubDirs = await fs.promises.readdir(chatsDir, { withFileTypes: true });
+        } catch (e) {
+            if (e.code !== 'ENOENT') {
+                console.warn(`[baibaoku] Failed to read chats directory:`, e.message);
+            }
+        }
+
+        // Find which character chats have changed
+        const chatUpdatePromises = [];
+        for (const dirent of chatSubDirs.filter(d => d.isDirectory())) {
+            const charName = dirent.name;
+            const avatarFilename = `${charName}.png`;
+            const cachedItem = cache.get(avatarFilename);
+
+            if (!cachedItem) continue; // No such character
+
+            const chatSubDir = path.join(chatsDir, charName);
+            const updateTask = async () => {
                 try {
-                    const rawDataStr = await parse(filePath, 'png');
-                    if (rawDataStr) {
-                        const shallowData = formatShallowCharacter(filename, stat, rawDataStr);
-                        const item = {
-                            mtime: stat.mtimeMs,
-                            size: stat.size,
-                            data: shallowData,
-                        };
-                        cache.set(filename, item);
-                        updatedItems.push({ filename, item });
+                    const chatDirStat = await fs.promises.stat(chatSubDir);
+                    const cachedChatStats = cachedItem.data?._chatStats;
+
+                    // Only update if this character's chat directory changed
+                    if (cachedChatStats?.chatDirMtime !== chatDirStat.mtimeMs) {
+                        const newChatStats = await calculateCharacterChatStats(chatsDir, avatarFilename, cachedChatStats);
+                        cachedItem.data.date_last_chat = newChatStats.dateLastChat;
+                        cachedItem.data.chat_size = newChatStats.chatSize;
+                        cachedItem.data._chatStats = newChatStats;
+                        updatedItems.push({ filename: avatarFilename, item: cachedItem });
                     }
                 } catch (e) {
-                    console.warn(`[baibaoku] Failed to parse character ${filename}:`, e.message);
+                    if (e.code !== 'ENOENT') {
+                        console.warn(`[baibaoku] Failed to update chat stats for ${avatarFilename}:`, e.message);
+                    }
                 }
             };
-            parsePromises.push(parseTask());
+            chatUpdatePromises.push(updateTask());
         }
+
+        await Promise.all(chatUpdatePromises);
     }
 
-    // 6. Wait for all parses to complete
-    // We can run these concurrently, as parse() reads the buffer async
-    await Promise.all(parsePromises);
+    // 5. Persist changes
     await persistCacheChanges(req, manager, updatedItems, deletedFilenames);
+
+    // 6. Update directory mtimes in cache
+    cache.charactersDirMtime = charactersDirStat.mtimeMs;
+    cache.chatsDirMtime = chatsDirStat?.mtimeMs || 0;
 
     return cache;
 }
@@ -3811,8 +3965,12 @@ export function registerStEndpoints(router, manager) {
             // 2. Await the update lock (whether we created it or someone else did)
             const cache = await updateLocks.get(userHandle);
 
-            // 3. Return the cached data as an array
-            const dataArray = Array.from(cache.values()).map(item => item.data);
+            // 3. Return the cached data as an array, removing internal fields
+            const dataArray = Array.from(cache.values()).map(item => {
+                const data = { ...item.data };
+                delete data._chatStats; // Remove internal chat stats
+                return data;
+            });
             res.json(dataArray);
 
         } catch (error) {
