@@ -6,7 +6,7 @@ import sanitize from 'sanitize-filename';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { parse } from '../../../src/character-card-parser.js';
 import { PUBLIC_DIRECTORIES, SETTINGS_FILE } from '../../../src/constants.js';
-import { generateTimestamp, getVersion, removeOldBackups, humanizedDateTime } from '../../../src/util.js';
+import { generateTimestamp, getVersion, removeOldBackups } from '../../../src/util.js';
 import { PLUGIN_ID } from './constants.js';
 import {
     getTiktokenTokenizer,
@@ -75,6 +75,30 @@ let staticSettingsPayload = null;
 const EARLY_BRIDGE_VERSION = '0.7';
 let fastVersionCache = null;
 let fastVersionPromise = null;
+
+/**
+ * Gets a humanized date time string for default chat names.
+ * Mirrors newer SillyTavern's util format without requiring that export.
+ */
+function humanizedDateTime(timestamp = Date.now()) {
+    const date = new Date(timestamp);
+    const dt = {
+        year: date.getFullYear(),
+        month: date.getMonth() + 1,
+        day: date.getDate(),
+        hour: date.getHours(),
+        minute: date.getMinutes(),
+        second: date.getSeconds(),
+        millisecond: date.getMilliseconds(),
+    };
+
+    for (const key in dt) {
+        const padLength = key === 'millisecond' ? 3 : 2;
+        dt[key] = String(dt[key]).padStart(padLength, '0');
+    }
+
+    return `${dt.year}-${dt.month}-${dt.day}@${dt.hour}h${dt.minute}m${dt.second}s${dt.millisecond}ms`;
+}
 
 /**
  * Normalizes tags from V1/V2 char data structure.
