@@ -13,7 +13,7 @@ import { setHeaderIfValid, setSafeHeader } from './header-utils.js';
 import { getStoragePaths } from './paths.js';
 
 const SAVE_GENERATE_JOB_TTL_MS = 2 * 24 * 60 * 60 * 1000;
-const SAVE_GENERATE_MAX_JOBS = 200;
+const SAVE_GENERATE_MAX_JOBS = 10;
 const SAVE_GENERATE_DEFAULT_ERROR_STATUS = 500;
 const SAVE_GENERATE_PERSIST_VERSION = 1;
 const SAVE_GENERATE_DATABASE = 'baibaoku.internal';
