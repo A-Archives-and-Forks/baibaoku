@@ -92,7 +92,7 @@ GET /api/plugins/baibaoku/v1/status
     "installed": true,
     "id": "baibaoku",
     "name": "柏宝库",
-    "version": "0.4.8",
+    "version": "0.5.0",
     "apiVersion": "v1",
     "storage": "per-user",
     "user": "default-user",
