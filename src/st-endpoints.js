@@ -36,6 +36,7 @@ const DEFAULT_PROGRESSIVE_CHAT_LOADING_ENABLED = false;
 const DEFAULT_TOKENIZER_BULK_COUNT_ENABLED = true;
 const DEFAULT_EXTENSION_MANIFEST_BUNDLE_ENABLED = true;
 const DEFAULT_VERSION_ACCELERATION_ENABLED = true;
+const DEFAULT_CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED = true;
 const SETTINGS_AUTOSAVE_INTERVAL = 10 * 60 * 1000;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
 const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
@@ -72,7 +73,7 @@ const settingsBackupSchedulers = new Map();
 const lastBackupTexts = new Map();
 const tokenizerLoadPromises = new WeakMap();
 let staticSettingsPayload = null;
-const EARLY_BRIDGE_VERSION = '0.7';
+const EARLY_BRIDGE_VERSION = '0.8';
 let fastVersionCache = null;
 let fastVersionPromise = null;
 
@@ -2582,6 +2583,7 @@ async function getSettingsFastConfig(req, manager) {
         tokenizerBulkCountEnabled: value.tokenizerBulkCountEnabled !== false,
         extensionManifestBundleEnabled: value.extensionManifestBundleEnabled !== false,
         versionAccelerationEnabled: value.versionAccelerationEnabled !== false,
+        chatKeyboardScanReductionEnabled: value.chatKeyboardScanReductionEnabled !== false,
     };
 }
 
@@ -2617,6 +2619,9 @@ async function setSettingsFastConfig(req, manager) {
         versionAccelerationEnabled: req.body?.versionAccelerationEnabled === undefined
             ? current.versionAccelerationEnabled !== false
             : req.body.versionAccelerationEnabled !== false,
+        chatKeyboardScanReductionEnabled: req.body?.chatKeyboardScanReductionEnabled === undefined
+            ? current.chatKeyboardScanReductionEnabled !== false
+            : req.body.chatKeyboardScanReductionEnabled !== false,
     };
 
     await manager.set(
@@ -2645,6 +2650,7 @@ async function getSettingsFastConfigSafe(req, manager) {
             tokenizerBulkCountEnabled: DEFAULT_TOKENIZER_BULK_COUNT_ENABLED,
             extensionManifestBundleEnabled: DEFAULT_EXTENSION_MANIFEST_BUNDLE_ENABLED,
             versionAccelerationEnabled: DEFAULT_VERSION_ACCELERATION_ENABLED,
+            chatKeyboardScanReductionEnabled: DEFAULT_CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED,
         };
     }
 }
@@ -2713,6 +2719,7 @@ function makeEarlyBridgeScript(options = {}) {
     const tokenizerBulkCountEnabled = options.tokenizerBulkCountEnabled !== false;
     const extensionManifestBundleEnabled = options.extensionManifestBundleEnabled !== false;
     const versionAccelerationEnabled = options.versionAccelerationEnabled !== false;
+    const chatKeyboardScanReductionEnabled = options.chatKeyboardScanReductionEnabled !== false;
 
     return `/* baibaoku early bridge v${EARLY_BRIDGE_VERSION} */
 (function () {
@@ -2735,6 +2742,7 @@ function makeEarlyBridgeScript(options = {}) {
   var TOKENIZER_BULK_COUNT_ENABLED = ${JSON.stringify(tokenizerBulkCountEnabled)};
   var EXTENSION_MANIFEST_BUNDLE_ENABLED = ${JSON.stringify(extensionManifestBundleEnabled)};
   var VERSION_ACCELERATION_ENABLED = ${JSON.stringify(versionAccelerationEnabled)};
+  var CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED = ${JSON.stringify(chatKeyboardScanReductionEnabled)};
 
   if (window[FLAG] && window[FLAG].installed) {
     return;
@@ -2782,6 +2790,163 @@ function makeEarlyBridgeScript(options = {}) {
   state.lazyThemeCurrentName = state.lazyThemeCurrentName || '';
   state.extensionManifestBundleCache = state.extensionManifestBundleCache || null;
   state.extensionManifestBundlePending = null;
+
+  // ---------------------------------------------------------------------------
+  // 聊天键盘扫描合并 (Chat keyboard scan reduction)
+  //
+  // SillyTavern 原生 scripts/keyboard.js 在 document.body 上挂了一个
+  // MutationObserver(subtree + class 属性),任何元素的 class 变化都会让它对
+  // 该节点子树重新扫描全部可交互控件(28 个 querySelectorAll + matches),用于设
+  // 置 Tab 焦点顺序。进入角色卡时大量消息会批量切换 class,导致这个 observer 被
+  // 逐条同步唤醒,造成明显卡顿(实测进卡阶段约 170ms)。
+  //
+  // 这里在 ST 主脚本求值之前包装全局 MutationObserver 构造函数,做两件事:
+  //   Layer 2 (始终开启): 把命中的那个 observer 的回调合并到下一帧,一帧内的多
+  //           次变化只触发一次扫描。功能完全不变(tabindex 只服务 Tab/Enter,本
+  //           就是异步交互),只是把“逐条同步全扫”变成“成批扫一次”。
+  //   Layer 3 (开关控制): 直接丢弃发生在 #chat 内部的纯 class 变化。这是开销的
+  //           绝对大头。代价仅是聊天区内联按钮的 Tab 键可达性会退化——点击/触摸
+  //           完全不受影响。开关关闭时退回到只有 Layer 2 的安全行为。
+  //
+  // 只精准命中 keyboard.js 那一个 observer(body + subtree + class 属性过滤),
+  // 其它所有 MutationObserver 原样放行,零误伤。任何异常都会静默降级为原生行为。
+  // ---------------------------------------------------------------------------
+  state.chatKeyboardScanReductionEnabled = CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED;
+  state.isChatKeyboardScanReductionEnabled = function () {
+    return state.chatKeyboardScanReductionEnabled !== false;
+  };
+  state.setChatKeyboardScanReductionEnabled = function (enabled) {
+    state.chatKeyboardScanReductionEnabled = Boolean(enabled);
+    return state.chatKeyboardScanReductionEnabled;
+  };
+
+  (function installKeyboardObserverCoalescing() {
+    try {
+      var NativeMutationObserver = window.MutationObserver;
+      if (typeof NativeMutationObserver !== 'function' || NativeMutationObserver.__baibaokuWrapped) {
+        return;
+      }
+
+      var schedule = (typeof window.requestAnimationFrame === 'function')
+        ? function (cb) { return window.requestAnimationFrame(cb); }
+        : function (cb) { return setTimeout(cb, 16); };
+
+      // 判断一个 observe() 调用是否就是 keyboard.js 那个全局 observer。
+      function isKeyboardObserverTarget(target, options) {
+        if (target !== document.body || !options || !options.subtree) {
+          return false;
+        }
+        if (!options.attributes && !options.attributeFilter) {
+          return false;
+        }
+        var filter = options.attributeFilter;
+        if (Array.isArray(filter)) {
+          return filter.indexOf('class') !== -1;
+        }
+        // attributes:true 且未限定 filter,也会收到 class 变化。
+        return options.attributes === true;
+      }
+
+      function isInsideChat(node) {
+        var el = (node && node.nodeType === 1) ? node : (node ? node.parentElement : null);
+        // closest 在元素上一定存在;#chat 是聊天消息容器。
+        return !!(el && typeof el.closest === 'function' && el.closest('#chat'));
+      }
+
+      // 过滤一批 mutation:丢弃 #chat 内部的纯 class 变化(Layer 3)。
+      // 返回需要转发给原始回调的 mutation 数组。
+      function filterChatClassMutations(mutations) {
+        var kept = [];
+        for (var i = 0; i < mutations.length; i++) {
+          var m = mutations[i];
+          var isClassAttr = m.type === 'attributes' && m.attributeName === 'class';
+          if (isClassAttr && isInsideChat(m.target)) {
+            continue;
+          }
+          kept.push(m);
+        }
+        return kept;
+      }
+
+      function WrappedMutationObserver(callback) {
+        if (typeof callback !== 'function') {
+          return new NativeMutationObserver(callback);
+        }
+
+        var self = this;
+        var isKeyboardObserver = false;
+        var pendingFlush = 0;
+        var queued = [];
+
+        function flush() {
+          pendingFlush = 0;
+          var batch = queued;
+          queued = [];
+          if (!batch.length) {
+            return;
+          }
+          try {
+            callback.call(self, batch, self);
+          } catch (_) {
+            // 原始回调内部错误不应影响包装层。
+          }
+        }
+
+        var observer = new NativeMutationObserver(function (mutations, obs) {
+          // 非目标 observer:行为完全透传,不做任何处理。
+          if (!isKeyboardObserver) {
+            callback.call(self, mutations, obs);
+            return;
+          }
+
+          // Layer 3(开关控制):丢弃 #chat 内部的纯 class 变化(开销大头)。
+          // 开关关闭时不丢弃,仅保留 Layer 2 合并。
+          var forwarded = state.isChatKeyboardScanReductionEnabled()
+            ? filterChatClassMutations(mutations)
+            : mutations;
+          if (!forwarded.length) {
+            return;
+          }
+
+          // Layer 2(始终开启):合并到下一帧,一帧内只触发一次扫描。
+          for (var i = 0; i < forwarded.length; i++) {
+            queued.push(forwarded[i]);
+          }
+          if (!pendingFlush) {
+            pendingFlush = schedule(flush);
+          }
+        });
+
+        // 暴露与原生一致的接口,并在 observe 时识别目标。
+        this.observe = function (target, options) {
+          if (isKeyboardObserverTarget(target, options)) {
+            isKeyboardObserver = true;
+          }
+          return observer.observe(target, options);
+        };
+        this.disconnect = function () {
+          queued = [];
+          if (pendingFlush) {
+            // rAF/timeout 句柄无法可靠区分;flush 会因 queued 为空而早退。
+            pendingFlush = 0;
+          }
+          return observer.disconnect();
+        };
+        this.takeRecords = function () {
+          var pending = queued;
+          queued = [];
+          return observer.takeRecords().concat(pending);
+        };
+      }
+
+      WrappedMutationObserver.prototype = NativeMutationObserver.prototype;
+      WrappedMutationObserver.__baibaokuWrapped = true;
+      window.MutationObserver = WrappedMutationObserver;
+      state.keyboardObserverCoalescingInstalled = true;
+    } catch (error) {
+      state.keyboardObserverCoalescingError = (error && error.message) ? error.message : String(error);
+    }
+  })();
 
   function clearExtensionManifestBundleCache(reason) {
     state.extensionManifestBundleCache = null;
