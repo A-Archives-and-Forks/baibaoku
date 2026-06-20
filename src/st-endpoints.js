@@ -39,6 +39,16 @@ const DEFAULT_VERSION_ACCELERATION_ENABLED = true;
 const DEFAULT_CHAT_KEYBOARD_SCAN_REDUCTION_ENABLED = true;
 const SETTINGS_AUTOSAVE_INTERVAL = 10 * 60 * 1000;
 const FAST_RECENT_CHAT_READ_BUFFER_SIZE = 1024 * 1024;
+const FAST_SEARCH_FILE_CONCURRENCY = 4;
+const FAST_SEARCH_PREVIEW_LENGTH = 400;
+const FAST_SEARCH_FORBIDDEN_REGEXP = path.sep === '/' ? /[/\x00]/ : /[/\x00\\]/;
+// Reuse the same internal database/version as fast-all (independent store).
+const FAST_SEARCH_CACHE_DATABASE = FAST_CHARACTER_CACHE_DATABASE;
+const FAST_SEARCH_CACHE_VERSION = FAST_CHARACTER_CACHE_VERSION;
+const FAST_SEARCH_CACHE_STORE = 'chats-fast-search';
+const FAST_SEARCH_CACHE_PAGE_SIZE = FAST_CHARACTER_CACHE_PAGE_SIZE;
+// Bump when the cached result object shape changes, to invalidate stale entries.
+const FAST_SEARCH_CACHE_SCHEMA = 1;
 const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
 const FAST_CHAT_GET_DEFAULT_INITIAL_MESSAGES = 5;
 const SETTINGS_TEXT_PERSIST_VERSION = 1;
@@ -55,6 +65,11 @@ const SETTINGS_THEME_INDEX_CACHE_VERSION = 1;
 
 // Cache structure: Map<userHandle, Map<filename, { mtime: number, size: number, data: Object }>>
 const userCaches = new Map();
+// Fast-search per-file result cache, persisted per user (like fast-all).
+// Cache structure: Map<userHandle, Map<filePath, { mtime, size, result }>>
+const fastSearchUserCaches = new Map();
+// Lock structure: Map<userHandle, Promise<Map>> to dedupe concurrent loads.
+const fastSearchLoadLocks = new Map();
 // Lock structure: Map<userHandle, Promise<void>>
 const updateLocks = new Map();
 // Cache structure: Map<userHandle, { sections: Map<string, Map<filename, CachedFile>> }>
@@ -753,6 +768,366 @@ function parseJsonLine(line) {
     } catch {
         return null;
     }
+}
+
+function getFastSearchPreviewMessage(lastMessage) {
+    if (!lastMessage) {
+        return '';
+    }
+
+    return lastMessage.length > FAST_SEARCH_PREVIEW_LENGTH
+        ? '...' + lastMessage.substring(lastMessage.length - FAST_SEARCH_PREVIEW_LENGTH)
+        : lastMessage;
+}
+
+function getFastSearchFragments(query) {
+    return String(query ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+async function mapFastSearchLimited(items, limit, mapper) {
+    if (items.length === 0) {
+        return [];
+    }
+
+    const results = new Array(items.length);
+    const workerCount = Math.max(1, Math.min(Math.floor(limit), items.length));
+    let nextIndex = 0;
+
+    async function worker() {
+        while (nextIndex < items.length) {
+            const index = nextIndex++;
+            try {
+                results[index] = { status: 'fulfilled', value: await mapper(items[index], index) };
+            } catch (reason) {
+                results[index] = { status: 'rejected', reason };
+            }
+        }
+    }
+
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    return results;
+}
+
+/**
+ * Scans a chat file and returns search metadata, mirroring ST's getChatSearchResult.
+ * Returns null for corrupted/invalid chat files so the caller can skip them.
+ */
+async function computeFastSearchResult(chatFilePath, stats) {
+    const parsedPath = path.parse(chatFilePath);
+    const result = {
+        file_name: parsedPath.name,
+        file_size: bytes.format(stats.size) ?? '',
+        message_count: 0,
+        last_mes: stats.mtimeMs,
+        preview_message: '[The chat is empty]',
+    };
+
+    if (stats.size === 0) {
+        return result;
+    }
+
+    const fileHandle = await fs.promises.open(chatFilePath, 'r');
+
+    try {
+        const scan = await scanJsonlLineInfo(fileHandle, stats.size);
+        result.message_count = Math.max(0, scan.lineCounter - 1);
+
+        if (scan.lastLineLength <= 0) {
+            return result;
+        }
+
+        const lastLine = await readFileRangeAsUtf8(fileHandle, scan.lastLineStart, scan.lastLineLength);
+        const jsonData = parseJsonLine(lastLine);
+        if (jsonData && (jsonData.name || jsonData.character_name || jsonData.chat_metadata)) {
+            result.preview_message = getFastSearchPreviewMessage(jsonData.mes || '[The message is empty]');
+            result.last_mes = jsonData.send_date || new Date(Math.round(stats.mtimeMs)).toISOString();
+            return result;
+        }
+
+        console.warn('[baibaoku] Found an invalid or corrupted chat file:', chatFilePath);
+        return null;
+    } finally {
+        await fileHandle.close();
+    }
+}
+
+function normalizeFastSearchCacheEntry(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return null;
+    }
+
+    if (value.schema !== FAST_SEARCH_CACHE_SCHEMA) {
+        return null;
+    }
+
+    if (!Number.isFinite(value.mtime) || !Number.isFinite(value.size)) {
+        return null;
+    }
+
+    // result may legitimately be null (cached marker for a corrupted file).
+    if (value.result !== null && (typeof value.result !== 'object' || Array.isArray(value.result))) {
+        return null;
+    }
+
+    return { mtime: value.mtime, size: value.size, result: value.result };
+}
+
+async function loadFastSearchCache(req, manager) {
+    const cache = new Map();
+    if (!manager) {
+        return cache;
+    }
+
+    try {
+        await manager.openForRequest(req, FAST_SEARCH_CACHE_DATABASE, {
+            displayName: '柏宝库内部缓存',
+            version: FAST_SEARCH_CACHE_VERSION,
+        });
+
+        let offset = 0;
+        while (true) {
+            const result = await manager.entries(req, FAST_SEARCH_CACHE_DATABASE, FAST_SEARCH_CACHE_STORE, {
+                prefix: '',
+                limit: FAST_SEARCH_CACHE_PAGE_SIZE,
+                offset,
+            });
+
+            const entries = result.entries || [];
+            for (const entry of entries) {
+                const item = normalizeFastSearchCacheEntry(entry.value);
+                if (item) {
+                    cache.set(entry.key, item);
+                }
+            }
+
+            if (entries.length < FAST_SEARCH_CACHE_PAGE_SIZE) {
+                break;
+            }
+            offset += FAST_SEARCH_CACHE_PAGE_SIZE;
+        }
+    } catch (error) {
+        console.warn('[baibaoku] Failed to load persistent fast-search cache:', error.message);
+    }
+
+    return cache;
+}
+
+async function getFastSearchUserCache(req, manager, userHandle) {
+    if (fastSearchUserCaches.has(userHandle)) {
+        return fastSearchUserCaches.get(userHandle);
+    }
+
+    // Dedupe concurrent first-loads for the same user.
+    if (!fastSearchLoadLocks.has(userHandle)) {
+        const loadPromise = loadFastSearchCache(req, manager)
+            .then((cache) => {
+                fastSearchUserCaches.set(userHandle, cache);
+                return cache;
+            })
+            .finally(() => fastSearchLoadLocks.delete(userHandle));
+        fastSearchLoadLocks.set(userHandle, loadPromise);
+    }
+
+    return fastSearchLoadLocks.get(userHandle);
+}
+
+async function persistFastSearchChanges(req, manager, updatedEntries, deletedKeys) {
+    if (!manager) {
+        return;
+    }
+
+    try {
+        for (let index = 0; index < updatedEntries.length; index += FAST_SEARCH_CACHE_PAGE_SIZE) {
+            const batch = updatedEntries.slice(index, index + FAST_SEARCH_CACHE_PAGE_SIZE);
+            if (batch.length) {
+                await manager.setMany(req, FAST_SEARCH_CACHE_DATABASE, FAST_SEARCH_CACHE_STORE, batch.map(({ key, item }) => ({
+                    key,
+                    value: { schema: FAST_SEARCH_CACHE_SCHEMA, ...item },
+                })));
+            }
+        }
+
+        for (let index = 0; index < deletedKeys.length; index += FAST_SEARCH_CACHE_PAGE_SIZE) {
+            const batch = deletedKeys.slice(index, index + FAST_SEARCH_CACHE_PAGE_SIZE);
+            if (batch.length) {
+                await manager.deleteMany(req, FAST_SEARCH_CACHE_DATABASE, FAST_SEARCH_CACHE_STORE, batch);
+            }
+        }
+    } catch (error) {
+        console.warn('[baibaoku] Failed to persist fast-search cache changes:', error.message);
+    }
+}
+
+/**
+ * Returns fast-search metadata for a chat file, reusing a cached result when the
+ * file's mtime and size are unchanged so the full file scan can be skipped.
+ * The stat() call is still required to detect changes (it is cheap relative to
+ * scanning the whole file). On a miss, the recomputed entry is pushed to
+ * `updatedEntries` so the caller can persist it.
+ */
+async function getFastSearchResult(chatFilePath, cache, updatedEntries) {
+    const stats = await fs.promises.stat(chatFilePath);
+    const cached = cache.get(chatFilePath);
+
+    if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
+        return cached.result;
+    }
+
+    const result = await computeFastSearchResult(chatFilePath, stats);
+    const item = { mtime: stats.mtimeMs, size: stats.size, result };
+    cache.set(chatFilePath, item);
+    updatedEntries.push({ key: chatFilePath, item });
+    return result;
+}
+
+async function collectFastSearchCharacterFiles(req, avatarUrl) {
+    const chatsDir = req.user?.directories?.chats;
+    if (!chatsDir) {
+        return [];
+    }
+
+    const characterName = String(avatarUrl).replace('.png', '');
+    const directoryPath = path.join(chatsDir, characterName);
+
+    if (!fs.existsSync(directoryPath)) {
+        return [];
+    }
+
+    const dirents = await fs.promises.readdir(directoryPath, { withFileTypes: true });
+    return dirents
+        .filter(dirent => dirent.isFile() && path.extname(dirent.name) === '.jsonl')
+        .map(dirent => path.join(directoryPath, dirent.name));
+}
+
+function getFastSearchCharacterDirPrefix(req, avatarUrl) {
+    const chatsDir = req.user?.directories?.chats;
+    if (!chatsDir || typeof avatarUrl !== 'string') {
+        return null;
+    }
+
+    const characterName = avatarUrl.replace('.png', '');
+    // Mirror the join used in collectFastSearchCharacterFiles so cache keys match.
+    return path.join(chatsDir, characterName) + path.sep;
+}
+
+async function collectFastSearchGroupFiles(req, groupId) {
+    const groupsDir = req.user?.directories?.groups;
+    const groupChatsDir = req.user?.directories?.groupChats;
+    if (!groupsDir || !groupChatsDir) {
+        return [];
+    }
+
+    const groupDirents = await fs.promises.readdir(groupsDir, { withFileTypes: true });
+    const groupFiles = groupDirents.filter(dirent => dirent.isFile() && path.extname(dirent.name) === '.json');
+
+    let targetGroup = null;
+    for (const groupFile of groupFiles) {
+        try {
+            const groupData = JSON.parse(await fs.promises.readFile(path.join(groupsDir, groupFile.name), 'utf8'));
+            if (groupData.id === groupId) {
+                targetGroup = groupData;
+                break;
+            }
+        } catch (error) {
+            console.warn('[baibaoku] Group file is corrupted:', groupFile.name, error.message);
+        }
+    }
+
+    if (!Array.isArray(targetGroup?.chats)) {
+        return [];
+    }
+
+    return targetGroup.chats
+        .map(chatId => path.join(groupChatsDir, `${chatId}.jsonl`))
+        .filter(filePath => fs.existsSync(filePath));
+}
+
+async function getFastSearch(req, manager) {
+    const userHandle = req.user?.profile?.handle;
+    if (!userHandle) {
+        const error = new Error('Unauthorized');
+        error.status = 401;
+        throw error;
+    }
+
+    const startedAt = Date.now();
+    const query = req.body?.query;
+    const avatarUrl = req.body?.avatar_url;
+    const groupId = req.body?.group_id;
+
+    // This fast path only handles the empty-query listing. Text queries fall back
+    // to ST's original /api/chats/search on the frontend.
+    if (getFastSearchFragments(query).length !== 0) {
+        const error = new Error('fast-search only supports empty queries');
+        error.status = 409;
+        throw error;
+    }
+
+    // Manual path-traversal guard (the plugin router has no validateAvatarUrlMiddleware).
+    if (typeof avatarUrl === 'string' && FAST_SEARCH_FORBIDDEN_REGEXP.test(avatarUrl)) {
+        const error = new Error('Invalid avatar_url');
+        error.status = 400;
+        throw error;
+    }
+
+    const chatFiles = groupId
+        ? await collectFastSearchGroupFiles(req, groupId)
+        : await collectFastSearchCharacterFiles(req, avatarUrl);
+
+    const cache = await getFastSearchUserCache(req, manager, userHandle);
+    const updatedEntries = [];
+
+    const settled = await mapFastSearchLimited(
+        chatFiles,
+        FAST_SEARCH_FILE_CONCURRENCY,
+        chatFile => getFastSearchResult(chatFile, cache, updatedEntries),
+    );
+    const data = [];
+    let invalidFiles = 0;
+    for (const item of settled) {
+        if (item.status === 'rejected') {
+            invalidFiles += 1;
+            console.warn('[baibaoku] Failed to read fast-search metadata:', item.reason);
+            continue;
+        }
+        if (item.value) {
+            data.push(item.value);
+        }
+    }
+
+    // Garbage-collect cache entries for chats that no longer exist. Only safe for
+    // the character branch, where chatFiles is the authoritative list for a single
+    // directory; group chats share a flat directory, so prefix-based GC would be
+    // unsafe and is skipped (those entries are bounded and simply linger).
+    const deletedKeys = [];
+    if (!groupId) {
+        const presentKeys = new Set(chatFiles);
+        const dirPrefix = getFastSearchCharacterDirPrefix(req, avatarUrl);
+        if (dirPrefix) {
+            for (const key of cache.keys()) {
+                if (key.startsWith(dirPrefix) && !presentKeys.has(key)) {
+                    cache.delete(key);
+                    deletedKeys.push(key);
+                }
+            }
+        }
+    }
+
+    if (updatedEntries.length || deletedKeys.length) {
+        await persistFastSearchChanges(req, manager, updatedEntries, deletedKeys);
+    }
+
+    return {
+        data,
+        metrics: {
+            totalMs: Date.now() - startedAt,
+            totalFiles: chatFiles.length,
+            validFiles: data.length,
+            invalidFiles,
+            cacheMisses: updatedEntries.length,
+            cacheGc: deletedKeys.length,
+        },
+    };
 }
 
 async function getFastChatGet(req) {
@@ -4093,6 +4468,8 @@ export function closeStEndpointCaches() {
     }
     settingsBackupSchedulers.clear();
     lastBackupTexts.clear();
+    fastSearchUserCaches.clear();
+    fastSearchLoadLocks.clear();
 }
 
 export function registerStEndpoints(router, manager) {
@@ -4180,6 +4557,25 @@ export function registerStEndpoints(router, manager) {
             res.json(data);
         } catch (error) {
             console.error('[baibaoku] Error in fast-recent endpoint:', error);
+            res.status(error.status || 500).json({ error: true, message: error.message });
+        }
+    });
+
+    router.post('/v1/chats/fast-search', async (req, res) => {
+        try {
+            const { data, metrics } = await getFastSearch(req, manager);
+
+            setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', metrics.totalMs);
+            setSafeHeader(res, 'X-Baibaoku-Search-Total-Files', metrics.totalFiles);
+            setSafeHeader(res, 'X-Baibaoku-Search-Valid-Files', metrics.validFiles);
+            setSafeHeader(res, 'X-Baibaoku-Search-Invalid-Files', metrics.invalidFiles);
+            setSafeHeader(res, 'X-Baibaoku-Search-Cache-Misses', metrics.cacheMisses);
+            setSafeHeader(res, 'X-Baibaoku-Search-Cache-Gc', metrics.cacheGc);
+            res.json(data);
+        } catch (error) {
+            if (!error.status || error.status >= 500) {
+                console.error('[baibaoku] Error in fast-search endpoint:', error);
+            }
             res.status(error.status || 500).json({ error: true, message: error.message });
         }
     });
