@@ -26,6 +26,7 @@ import {
     listPresetBackups,
     renamePresetBackup,
     savePresetBackup,
+    updatePresetBackupNote,
 } from './preset-backups.js';
 
 export function registerApi(router, manager) {
@@ -54,6 +55,10 @@ export function registerApi(router, manager) {
 
     router.post('/v1/preset-backups/save/rename', route(async (req, res) => {
         sendOk(res, await renamePresetBackup(req));
+    }));
+
+    router.post('/v1/preset-backups/save/note', route(async (req, res) => {
+        sendOk(res, await updatePresetBackupNote(req));
     }));
 
     router.post('/v1/preset-backups/save/delete', route(async (req, res) => {

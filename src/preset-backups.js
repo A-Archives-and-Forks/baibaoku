@@ -10,6 +10,7 @@ const PRESET_BACKUP_INDEX_FILE_NAME = 'index.json';
 const PRESET_BACKUP_EXTENSION = '.json';
 const MAX_PRESET_BACKUP_NAME_LENGTH = 160;
 const MAX_PRESET_BACKUP_FILE_NAME_LENGTH = 240;
+const MAX_PRESET_BACKUP_NOTE_LENGTH = 500;
 let presetBackupIndexQueue = Promise.resolve();
 
 export async function savePresetBackup(req) {
@@ -82,7 +83,27 @@ export async function renamePresetBackup(req) {
     const filePath = resolvePresetBackupFilePath(directory, fileName);
     const stat = await statExistingPresetBackup(filePath);
     const index = await updatePresetBackupIndex(directory, currentIndex => {
-        currentIndex[fileName] = { showName };
+        currentIndex[fileName] = { ...currentIndex[fileName], showName };
+    });
+    return toPresetBackupResponseItem(formatPresetBackupListItem(fileName, stat, index));
+}
+
+export async function updatePresetBackupNote(req) {
+    const directory = await getPresetBackupDirectory(req);
+    const fileName = normalizePresetBackupFileName(req.body?.fileName ?? req.body?.name);
+    const note = normalizePresetBackupNote(req.body?.note);
+    const filePath = resolvePresetBackupFilePath(directory, fileName);
+    const stat = await statExistingPresetBackup(filePath);
+    const index = await updatePresetBackupIndex(directory, currentIndex => {
+        const entry = { ...currentIndex[fileName] };
+
+        if (note) {
+            entry.note = note;
+        } else {
+            delete entry.note;
+        }
+
+        currentIndex[fileName] = entry;
     });
     return toPresetBackupResponseItem(formatPresetBackupListItem(fileName, stat, index));
 }
@@ -169,6 +190,24 @@ function normalizePresetBackupDisplayName(value) {
     }
 
     return name;
+}
+
+function normalizePresetBackupNote(value) {
+    if (value === undefined || value === null) {
+        return '';
+    }
+
+    if (typeof value !== 'string') {
+        throw new BaiBaoKuError('INVALID_PRESET_BACKUP_NOTE', 'Preset backup note must be a string.', 400);
+    }
+
+    const note = value.replace(/\0/g, '').trim();
+
+    if (note.length > MAX_PRESET_BACKUP_NOTE_LENGTH) {
+        throw new BaiBaoKuError('INVALID_PRESET_BACKUP_NOTE', `Preset backup note must be up to ${MAX_PRESET_BACKUP_NOTE_LENGTH} characters.`, 400);
+    }
+
+    return note;
 }
 
 function sanitizePresetBackupFilePart(value) {
@@ -292,13 +331,14 @@ function formatPresetBackupListItem(fileName, stat, index = {}) {
     return {
         fileName,
         showName: getPresetBackupShowName(fileName, index),
+        note: getPresetBackupNote(fileName, index),
         createdAt: new Date(createdAtMs).toISOString(),
         createdAtMs,
     };
 }
 
-function toPresetBackupResponseItem({ fileName, showName, createdAt }) {
-    return { fileName, showName, createdAt };
+function toPresetBackupResponseItem({ fileName, showName, note, createdAt }) {
+    return { fileName, showName, note: note ?? '', createdAt };
 }
 
 function getPresetBackupShowName(fileName, index) {
@@ -309,6 +349,16 @@ function getPresetBackupShowName(fileName, index) {
     }
 
     return fileName;
+}
+
+function getPresetBackupNote(fileName, index) {
+    const note = index?.[fileName]?.note;
+
+    if (typeof note === 'string' && note.trim()) {
+        return note.trim();
+    }
+
+    return '';
 }
 
 function getCreatedAtMs(stat) {
