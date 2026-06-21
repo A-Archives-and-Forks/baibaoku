@@ -62,6 +62,14 @@ const SETTINGS_THEME_MODE_FULL = 'full';
 const SETTINGS_THEME_MODE_LAZY = 'lazy';
 const SETTINGS_LAZY_THEME_MARKER = '__baibaokuLazyTheme';
 const SETTINGS_THEME_INDEX_CACHE_VERSION = 1;
+// Orphaned atomic-write temp files (`*.tmp`) can leak in the cache directory when
+// a rename is interrupted (process kill, AV/sync locking the file on Windows).
+// They are never read back, so any temp file older than this is safe to delete.
+const CACHE_TMP_ORPHAN_MAX_AGE_MS = 60 * 1000;
+// Throttle the opportunistic sweep so frequent writes don't each scan the dir.
+const CACHE_TMP_SWEEP_MIN_INTERVAL_MS = 5 * 60 * 1000;
+// Map<cacheDirectory, lastSweepAtMs> to throttle sweeps per directory.
+const cacheTmpSweepTimestamps = new Map();
 
 // Cache structure: Map<userHandle, Map<filename, { mtime: number, size: number, data: Object }>>
 const userCaches = new Map();
@@ -84,8 +92,8 @@ const settingsSaveLocks = new Map();
 const settingsResponseCaches = new Map();
 // Scheduler structure: Map<userHandle, { lastBackupAt: number, timer: Timeout|null, pendingPayload: Object|null }>
 const settingsBackupSchedulers = new Map();
-// Cache structure: Map<userHandle, string>
-const lastBackupTexts = new Map();
+// Cache structure: Map<userHandle, string> (content hash of the last backed-up settings)
+const lastBackupHashes = new Map();
 const tokenizerLoadPromises = new WeakMap();
 let staticSettingsPayload = null;
 const EARLY_BRIDGE_VERSION = '0.8';
@@ -1765,8 +1773,13 @@ async function backupSettingsIfChanged(payload) {
         return;
     }
 
-    const text = cached.text;
-    if (lastBackupTexts.get(userHandle) === text) {
+    // Compare by content hash instead of the full text so we don't keep a second
+    // copy of (potentially very large) settings resident in memory just to detect
+    // changes. The hash is already computed when the settings text is cached.
+    const contentHash = typeof cached.contentHash === 'string'
+        ? cached.contentHash
+        : hashSettingsFileContent(cached.text);
+    if (lastBackupHashes.get(userHandle) === contentHash) {
         return;
     }
 
@@ -1775,7 +1788,7 @@ async function backupSettingsIfChanged(payload) {
     const backupFile = path.join(backupDir, `${getSettingsBackupFilePrefix(userHandle)}${generateTimestamp()}.json`);
     await fs.promises.copyFile(settingsPath, backupFile);
     removeOldBackups(backupDir, `settings_${userHandle}`);
-    lastBackupTexts.set(userHandle, text);
+    lastBackupHashes.set(userHandle, contentHash);
 }
 
 function getSettingsUserCache(userHandle) {
@@ -2359,7 +2372,8 @@ async function reconcilePersistedSectionSignature(directoryPath, persistedSectio
 }
 
 async function writeFileAtomicAsync(filePath, data, options = 'utf8') {
-    await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+    const directory = path.dirname(filePath);
+    await fs.promises.mkdir(directory, { recursive: true });
     const tempPath = `${filePath}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
 
     try {
@@ -2369,6 +2383,57 @@ async function writeFileAtomicAsync(filePath, data, options = 'utf8') {
         await fs.promises.unlink(tempPath).catch(() => {});
         throw error;
     }
+
+    // Opportunistically clean up orphaned temp files left behind by interrupted
+    // renames. Throttled, non-blocking, and best-effort — failures are ignored.
+    scheduleOrphanedCacheTmpSweep(directory);
+}
+
+function scheduleOrphanedCacheTmpSweep(directory) {
+    const now = Date.now();
+    const lastSweepAt = cacheTmpSweepTimestamps.get(directory) || 0;
+    if (now - lastSweepAt < CACHE_TMP_SWEEP_MIN_INTERVAL_MS) {
+        return;
+    }
+    cacheTmpSweepTimestamps.set(directory, now);
+
+    setTimeout(() => {
+        void sweepOrphanedCacheTmpFiles(directory).catch((error) => {
+            console.warn('[baibaoku] Failed to sweep orphaned cache temp files:', error.message);
+        });
+    }, 0);
+}
+
+async function sweepOrphanedCacheTmpFiles(directory) {
+    let entries;
+    try {
+        entries = await fs.promises.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+        if (error?.code === 'ENOENT') {
+            return;
+        }
+        throw error;
+    }
+
+    const now = Date.now();
+    await Promise.all(entries.map(async (entry) => {
+        if (!entry.isFile() || !entry.name.endsWith('.tmp')) {
+            return;
+        }
+
+        const tmpPath = path.join(directory, entry.name);
+        try {
+            const stat = await fs.promises.stat(tmpPath);
+            if (now - stat.mtimeMs < CACHE_TMP_ORPHAN_MAX_AGE_MS) {
+                return; // Possibly an in-flight write from a concurrent atomic save.
+            }
+            await fs.promises.unlink(tmpPath);
+        } catch (error) {
+            if (error?.code !== 'ENOENT') {
+                console.warn(`[baibaoku] Failed to remove orphaned temp file ${entry.name}:`, error.message);
+            }
+        }
+    }));
 }
 
 function restorePersistedSectionCache(userCache, sectionName, persistedSection) {
@@ -4467,7 +4532,8 @@ export function closeStEndpointCaches() {
         }
     }
     settingsBackupSchedulers.clear();
-    lastBackupTexts.clear();
+    lastBackupHashes.clear();
+    cacheTmpSweepTimestamps.clear();
     fastSearchUserCaches.clear();
     fastSearchLoadLocks.clear();
 }
