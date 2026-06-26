@@ -205,6 +205,11 @@ function createSaveGenerateJob(req) {
             file_name: descriptor.fileName,
             ch_name: descriptor.characterName,
             expectedVersion: normalizeExpectedVersion(save.expectedVersion ?? save.expected_version),
+            // Floor index the reply should occupy, as the front end measured it
+            // at request time. Stored verbatim and echoed back so the front end
+            // (and the pending-lookup below) can compare against one consistent
+            // basis instead of this process's on-disk line count.
+            expectedFloor: normalizeSaveGenerateMessageFloor(save.expectedFloor ?? save.expected_floor),
         },
         descriptor,
         generate: structuredClone(generate),
@@ -1226,6 +1231,7 @@ function restorePersistedSaveGenerateJob(req, payload) {
             file_name: String(save.file_name || ''),
             ch_name: String(save.ch_name || ''),
             expectedVersion: normalizeExpectedVersion(save.expectedVersion ?? save.expected_version),
+            expectedFloor: normalizeSaveGenerateMessageFloor(save.expectedFloor ?? save.expected_floor),
         },
         descriptor,
         generate: rawJob.generate && typeof rawJob.generate === 'object' ? rawJob.generate : {},
@@ -1672,19 +1678,39 @@ async function findSaveGenerateJobForChat(req, chatId, lastMessageHash = '', las
         return null;
     }
 
-    if (isSaveGenerateSavedStatus(latestTerminal.status)
-        && isSaveGenerateClientTailAlreadyHasJob(latestTerminal, lastMessageInfo)) {
-        return null;
-    }
+    if (isSaveGenerateSavedStatus(latestTerminal.status)) {
+        // Single-basis decision: the reply may only be (re)inserted when the
+        // client's current tail is exactly one floor short of where the reply
+        // was expected to land. Anything else — tail already at/over that floor
+        // (the duplicate case) or a larger gap — means "do not insert". This
+        // compares the floor the front end reported now against the floor the
+        // front end declared at request time, so there is no front-end-array vs
+        // on-disk-line-count drift. Old jobs carry no expectedFloor and are
+        // intentionally never resurfaced here.
+        const expectedFloor = normalizeSaveGenerateMessageFloor(latestTerminal.save?.expectedFloor);
+        const clientTailFloor = normalizeSaveGenerateMessageFloor(lastMessageInfo?.floor);
+        if (expectedFloor >= 0 && clientTailFloor >= 0) {
+            if (clientTailFloor + 1 === expectedFloor) {
+                return serializeSaveGenerateJob(latestTerminal);
+            }
+            return null;
+        }
 
-    if (isSaveGenerateSavedStatus(latestTerminal.status)
-        && isSaveGenerateLastMessageHashMatch(latestTerminal, lastMessageHash)) {
-        return null;
-    }
+        // No expectedFloor on the job (legacy) — suppress rather than risk a
+        // duplicate; recovery for such jobs is no longer supported.
+        if (expectedFloor < 0) {
+            return null;
+        }
 
-    if (isSaveGenerateSavedStatus(latestTerminal.status)
-        && await isSaveGenerateJobAlreadyAtChatTail(latestTerminal)) {
-        return null;
+        // expectedFloor known but the client did not report its tail floor: fall
+        // back to the legacy hash/content checks before deciding to insert.
+        if (isSaveGenerateLastMessageHashMatch(latestTerminal, lastMessageHash)) {
+            return null;
+        }
+
+        if (await isSaveGenerateJobAlreadyAtChatTail(latestTerminal)) {
+            return null;
+        }
     }
 
     return serializeSaveGenerateJob(latestTerminal);
