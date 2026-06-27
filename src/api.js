@@ -20,6 +20,7 @@ import {
     normalizeSetManyEntries,
 } from './validate.js';
 import { registerStEndpoints } from './st-endpoints.js';
+import { registerVectorRoutes } from './vector-routes.js';
 import {
     deletePresetBackup,
     downloadPresetBackup,
@@ -29,8 +30,9 @@ import {
     updatePresetBackupNote,
 } from './preset-backups.js';
 
-export function registerApi(router, manager) {
+export function registerApi(router, manager, vectorStore) {
     registerStEndpoints(router, manager);
+    if (vectorStore) registerVectorRoutes(router, vectorStore);
 
     router.get('/health', route(async (req, res) => {
         sendOk(res, await getStatusPayload(req, manager));

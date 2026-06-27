@@ -1,6 +1,7 @@
 import { registerApi } from './src/api.js';
 import { PLUGIN_ID, PLUGIN_NAME } from './src/constants.js';
 import { DatabaseManager } from './src/database.js';
+import { VectorStore } from './src/vector-store.js';
 import { installEarlyBridge } from './src/early-bridge-installer.js';
 import { installOpenAITokenizerBridge } from './src/openai-tokenizer-bridge-installer.js';
 import { installThemeBridge } from './src/theme-bridge-installer.js';
@@ -14,9 +15,10 @@ export const info = {
 };
 
 const manager = new DatabaseManager();
+const vectorStore = new VectorStore(manager);
 
 export async function init(router) {
-    registerApi(router, manager);
+    registerApi(router, manager, vectorStore);
     installEarlyBridge();
     installOpenAITokenizerBridge();
     installWorldInfoTokenizerBridge();

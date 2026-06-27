@@ -67,6 +67,16 @@ export class DatabaseManager {
         };
     }
 
+    /**
+     * 借出一个「已建好基础 schema」的数据库连接(复用连接池/WAL)。
+     * 供 VectorStore 等扩展模块在同一份 <db>.sqlite 上自建自管它们的表(如 vec_items),
+     * 不污染本类的 KV 逻辑。返回的连接由 DatabaseManager 统一持有与关闭。
+     */
+    async getConnection(req, database, options = {}) {
+        const context = await this.#getContext(req, database, options);
+        return context.db;
+    }
+
     async set(req, database, store, key, value, options = {}) {
         const context = await this.#getContext(req, database);
         const now = Date.now();
