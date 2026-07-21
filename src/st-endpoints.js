@@ -49,6 +49,14 @@ const FAST_SEARCH_CACHE_STORE = 'chats-fast-search';
 const FAST_SEARCH_CACHE_PAGE_SIZE = FAST_CHARACTER_CACHE_PAGE_SIZE;
 // Bump when the cached result object shape changes, to invalidate stale entries.
 const FAST_SEARCH_CACHE_SCHEMA = 1;
+const CHAT_BACKUP_CACHE_DATABASE = FAST_CHARACTER_CACHE_DATABASE;
+const CHAT_BACKUP_CACHE_VERSION = FAST_CHARACTER_CACHE_VERSION;
+const CHAT_BACKUP_CACHE_STORE = 'chat-backups-fast-list';
+const CHAT_BACKUP_CACHE_PAGE_SIZE = FAST_CHARACTER_CACHE_PAGE_SIZE;
+const CHAT_BACKUP_CACHE_SCHEMA = 1;
+const CHAT_BACKUP_FILE_CONCURRENCY = 16;
+const CHAT_BACKUP_FILE_PREFIX = 'chat_';
+const CHAT_BACKUP_FILE_EXTENSION = '.jsonl';
 const FAST_CHAT_GET_DEFAULT_THRESHOLD_BYTES = 2 * 1024 * 1024;
 const FAST_CHAT_GET_DEFAULT_INITIAL_MESSAGES = 5;
 const SETTINGS_TEXT_PERSIST_VERSION = 1;
@@ -78,6 +86,12 @@ const userCaches = new Map();
 const fastSearchUserCaches = new Map();
 // Lock structure: Map<userHandle, Promise<Map>> to dedupe concurrent loads.
 const fastSearchLoadLocks = new Map();
+// Cache structure: Map<userHandle, Map<filename, { mtime, size, chatItems }>>
+const chatBackupUserCaches = new Map();
+// Lock structure: Map<userHandle, Promise<Map>>
+const chatBackupLoadLocks = new Map();
+// Lock structure: Map<userHandle, Promise<{ data, metrics }>>
+const chatBackupUpdateLocks = new Map();
 // Lock structure: Map<userHandle, Promise<void>>
 const updateLocks = new Map();
 // Cache structure: Map<userHandle, { sections: Map<string, Map<filename, CachedFile>> }>
@@ -964,6 +978,219 @@ async function persistFastSearchChanges(req, manager, updatedEntries, deletedKey
     } catch (error) {
         console.warn('[baibaoku] Failed to persist fast-search cache changes:', error.message);
     }
+}
+
+function normalizeChatBackupCacheEntry(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return null;
+    }
+
+    if (value.schema !== CHAT_BACKUP_CACHE_SCHEMA) {
+        return null;
+    }
+
+    if (!Number.isFinite(value.mtime) || !Number.isFinite(value.size)) {
+        return null;
+    }
+
+    if (!Number.isInteger(value.chatItems) || value.chatItems < 0) {
+        return null;
+    }
+
+    return {
+        mtime: value.mtime,
+        size: value.size,
+        chatItems: value.chatItems,
+    };
+}
+
+async function loadChatBackupCache(req, manager) {
+    const cache = new Map();
+    if (!manager) {
+        return cache;
+    }
+
+    try {
+        await manager.openForRequest(req, CHAT_BACKUP_CACHE_DATABASE, {
+            displayName: 'BaiBaoKu internal cache',
+            version: CHAT_BACKUP_CACHE_VERSION,
+        });
+
+        let offset = 0;
+        while (true) {
+            const result = await manager.entries(req, CHAT_BACKUP_CACHE_DATABASE, CHAT_BACKUP_CACHE_STORE, {
+                prefix: '',
+                limit: CHAT_BACKUP_CACHE_PAGE_SIZE,
+                offset,
+            });
+            const entries = result.entries || [];
+
+            for (const entry of entries) {
+                const item = normalizeChatBackupCacheEntry(entry.value);
+                if (item) {
+                    cache.set(entry.key, item);
+                }
+            }
+
+            if (entries.length < CHAT_BACKUP_CACHE_PAGE_SIZE) {
+                break;
+            }
+            offset += CHAT_BACKUP_CACHE_PAGE_SIZE;
+        }
+    } catch (error) {
+        console.warn('[baibaoku] Failed to load persistent chat backup cache:', error.message);
+    }
+
+    return cache;
+}
+
+async function getChatBackupUserCache(req, manager, userHandle) {
+    if (chatBackupUserCaches.has(userHandle)) {
+        return chatBackupUserCaches.get(userHandle);
+    }
+
+    if (!chatBackupLoadLocks.has(userHandle)) {
+        const loadPromise = loadChatBackupCache(req, manager)
+            .then((cache) => {
+                chatBackupUserCaches.set(userHandle, cache);
+                return cache;
+            })
+            .finally(() => chatBackupLoadLocks.delete(userHandle));
+        chatBackupLoadLocks.set(userHandle, loadPromise);
+    }
+
+    return chatBackupLoadLocks.get(userHandle);
+}
+
+async function persistChatBackupChanges(req, manager, updatedEntries, deletedKeys) {
+    if (!manager) {
+        return;
+    }
+
+    try {
+        for (let index = 0; index < updatedEntries.length; index += CHAT_BACKUP_CACHE_PAGE_SIZE) {
+            const batch = updatedEntries.slice(index, index + CHAT_BACKUP_CACHE_PAGE_SIZE);
+            if (batch.length) {
+                await manager.setMany(req, CHAT_BACKUP_CACHE_DATABASE, CHAT_BACKUP_CACHE_STORE, batch.map(({ key, item }) => ({
+                    key,
+                    value: { schema: CHAT_BACKUP_CACHE_SCHEMA, ...item },
+                })));
+            }
+        }
+
+        for (let index = 0; index < deletedKeys.length; index += CHAT_BACKUP_CACHE_PAGE_SIZE) {
+            const batch = deletedKeys.slice(index, index + CHAT_BACKUP_CACHE_PAGE_SIZE);
+            if (batch.length) {
+                await manager.deleteMany(req, CHAT_BACKUP_CACHE_DATABASE, CHAT_BACKUP_CACHE_STORE, batch);
+            }
+        }
+    } catch (error) {
+        console.warn('[baibaoku] Failed to persist chat backup cache changes:', error.message);
+    }
+}
+
+async function countChatBackupItems(filePath, fileSize) {
+    if (fileSize <= 0) {
+        return 0;
+    }
+
+    const fileHandle = await fs.promises.open(filePath, 'r');
+    try {
+        const scan = await scanJsonlLineInfo(fileHandle, fileSize);
+        return Math.max(0, scan.lineCounter - 1);
+    } finally {
+        await fileHandle.close();
+    }
+}
+
+async function getFastChatBackupList(req, manager) {
+    const userHandle = req.user?.profile?.handle;
+    const backupDirectory = req.user?.directories?.backups;
+    if (!userHandle || !backupDirectory) {
+        const error = new Error('Unauthorized');
+        error.status = 401;
+        throw error;
+    }
+
+    const startedAt = Date.now();
+    const dirents = await fs.promises.readdir(backupDirectory, { withFileTypes: true });
+    const backupFiles = dirents
+        .filter(dirent => dirent.isFile()
+            && dirent.name.startsWith(CHAT_BACKUP_FILE_PREFIX)
+            && path.extname(dirent.name) === CHAT_BACKUP_FILE_EXTENSION)
+        .map(dirent => dirent.name);
+    const currentFiles = new Set(backupFiles);
+    const cache = await getChatBackupUserCache(req, manager, userHandle);
+    const updatedEntries = [];
+    let cacheHits = 0;
+    let cacheMisses = 0;
+
+    const settled = await mapFastSearchLimited(
+        backupFiles,
+        CHAT_BACKUP_FILE_CONCURRENCY,
+        async (fileName) => {
+            const filePath = path.join(backupDirectory, fileName);
+            const stats = await fs.promises.stat(filePath);
+            const cached = cache.get(fileName);
+            let chatItems;
+
+            if (cached && cached.mtime === stats.mtimeMs && cached.size === stats.size) {
+                cacheHits += 1;
+                chatItems = cached.chatItems;
+            } else {
+                cacheMisses += 1;
+                chatItems = await countChatBackupItems(filePath, stats.size);
+                const item = {
+                    mtime: stats.mtimeMs,
+                    size: stats.size,
+                    chatItems,
+                };
+                cache.set(fileName, item);
+                updatedEntries.push({ key: fileName, item });
+            }
+
+            return {
+                file_name: fileName,
+                file_size: bytes.format(stats.size) ?? '',
+                chat_items: chatItems,
+                last_mes: stats.mtimeMs,
+            };
+        },
+    );
+
+    const data = [];
+    let invalidFiles = 0;
+    for (const item of settled) {
+        if (item.status === 'fulfilled') {
+            data.push(item.value);
+        } else {
+            invalidFiles += 1;
+            console.warn('[baibaoku] Failed to read chat backup metadata:', item.reason);
+        }
+    }
+
+    const deletedKeys = [];
+    for (const key of cache.keys()) {
+        if (!currentFiles.has(key)) {
+            cache.delete(key);
+            deletedKeys.push(key);
+        }
+    }
+
+    await persistChatBackupChanges(req, manager, updatedEntries, deletedKeys);
+
+    return {
+        data,
+        metrics: {
+            totalMs: Date.now() - startedAt,
+            totalFiles: backupFiles.length,
+            validFiles: data.length,
+            invalidFiles,
+            cacheHits,
+            cacheMisses,
+            cacheGc: deletedKeys.length,
+        },
+    };
 }
 
 /**
@@ -4536,6 +4763,9 @@ export function closeStEndpointCaches() {
     cacheTmpSweepTimestamps.clear();
     fastSearchUserCaches.clear();
     fastSearchLoadLocks.clear();
+    chatBackupUserCaches.clear();
+    chatBackupLoadLocks.clear();
+    chatBackupUpdateLocks.clear();
 }
 
 export function registerStEndpoints(router, manager) {
@@ -4608,6 +4838,34 @@ export function registerStEndpoints(router, manager) {
         } catch (error) {
             console.error('[baibaoku] Error in fast-all endpoint:', error);
             res.status(500).json({ error: true, message: error.message });
+        }
+    });
+
+    router.post('/v1/chat-backups/fast-list', async (req, res) => {
+        try {
+            const userHandle = req.user?.profile?.handle;
+            if (!userHandle) {
+                return res.status(401).json({ error: true, message: 'Unauthorized' });
+            }
+
+            if (!chatBackupUpdateLocks.has(userHandle)) {
+                const updatePromise = getFastChatBackupList(req, manager)
+                    .finally(() => chatBackupUpdateLocks.delete(userHandle));
+                chatBackupUpdateLocks.set(userHandle, updatePromise);
+            }
+
+            const { data, metrics } = await chatBackupUpdateLocks.get(userHandle);
+            setSafeHeader(res, 'X-Baibaoku-Elapsed-Ms', metrics.totalMs);
+            setSafeHeader(res, 'X-Baibaoku-Backup-Total', metrics.totalFiles);
+            setSafeHeader(res, 'X-Baibaoku-Backup-Valid', metrics.validFiles);
+            setSafeHeader(res, 'X-Baibaoku-Backup-Invalid', metrics.invalidFiles);
+            setSafeHeader(res, 'X-Baibaoku-Cache-Hits', metrics.cacheHits);
+            setSafeHeader(res, 'X-Baibaoku-Cache-Misses', metrics.cacheMisses);
+            setSafeHeader(res, 'X-Baibaoku-Cache-Gc', metrics.cacheGc);
+            res.json(data);
+        } catch (error) {
+            console.error('[baibaoku] Error in fast chat backup list endpoint:', error);
+            res.status(error.status || 500).json({ error: true, message: error.message });
         }
     });
 
