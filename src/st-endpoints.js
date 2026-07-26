@@ -110,7 +110,7 @@ const settingsBackupSchedulers = new Map();
 const lastBackupHashes = new Map();
 const tokenizerLoadPromises = new WeakMap();
 let staticSettingsPayload = null;
-const EARLY_BRIDGE_VERSION = '0.8';
+const EARLY_BRIDGE_VERSION = '1.0';
 let fastVersionCache = null;
 let fastVersionPromise = null;
 
@@ -3545,6 +3545,35 @@ function makeEarlyBridgeScript(options = {}) {
         var pendingFlush = 0;
         var queued = [];
 
+        // 一帧内积压的独立扫描根(attribute 目标 + childList 新增节点)超过该值时,
+        // 逐节点扫描的总成本必然超过对 document.body 的一次全量扫描,直接降级整扫。
+        var FULL_SCAN_THRESHOLD = 40;
+
+        // keyboard.js 的 initializeScrollResetBehaviors 对 .scroll-reset-container
+        // 不去重地重复 addEventListener('focusout')。整扫会以 body 为根命中全部
+        // 容器,每次降级都累积一份重复监听。整扫期间把“已见过”的容器类名临时
+        // 摘掉(该函数靠 querySelectorAll 按类名找目标),结束后恢复;首次见到
+        // 的容器不隐藏(可能尚未初始化,漏挂比重复挂更糟),记入 seen。
+        var scrollResetSeen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+
+        function hideSeenScrollResetContainers() {
+          if (!scrollResetSeen || !document.body || typeof document.body.querySelectorAll !== 'function') {
+            return [];
+          }
+          var hidden = [];
+          var containers = document.body.querySelectorAll('.scroll-reset-container');
+          for (var i = 0; i < containers.length; i++) {
+            var container = containers[i];
+            if (scrollResetSeen.has(container)) {
+              container.classList.remove('scroll-reset-container');
+              hidden.push(container);
+            } else {
+              scrollResetSeen.add(container);
+            }
+          }
+          return hidden;
+        }
+
         function flush() {
           pendingFlush = 0;
           var batch = queued;
@@ -3552,10 +3581,58 @@ function makeEarlyBridgeScript(options = {}) {
           if (!batch.length) {
             return;
           }
+
+          // 去重:同一 target 在一帧内的多次 class 变化只需扫一次;childList 原样保留。
+          var deduped = [];
+          var seenAttrTargets = (typeof Set === 'function') ? new Set() : null;
+          var rootCount = 0;
+          for (var i = 0; i < batch.length; i++) {
+            var m = batch[i];
+            if (m.type === 'attributes') {
+              if (seenAttrTargets) {
+                if (seenAttrTargets.has(m.target)) {
+                  continue;
+                }
+                seenAttrTargets.add(m.target);
+              }
+              deduped.push(m);
+              rootCount += 1;
+            } else {
+              deduped.push(m);
+              rootCount += (m.addedNodes && m.addedNodes.length) || 0;
+            }
+          }
+
+          // 大批量降级:mutation 风暴(主题切换、批量渲染)下,keyboard.js 会对每个
+          // 变动节点各跑一遍全部选择器(N 次 querySelectorAll + matches)。改为转发一条
+          // 合成 childList 记录,让它对 document.body 整体扫一次——覆盖范围是原批次的
+          // 超集,成本从 N 次子树扫描降为 1 次全文档扫描。
+          var hiddenContainers = [];
+          if (rootCount > FULL_SCAN_THRESHOLD && document.body) {
+            deduped = [{
+              type: 'childList',
+              target: document.body,
+              addedNodes: [document.body],
+              removedNodes: [],
+              attributeName: null,
+            }];
+            hiddenContainers = hideSeenScrollResetContainers();
+          }
+
           try {
-            callback.call(self, batch, self);
+            callback.call(self, deduped, self);
           } catch (_) {
             // 原始回调内部错误不应影响包装层。
+          } finally {
+            if (hiddenContainers.length) {
+              for (var j = 0; j < hiddenContainers.length; j++) {
+                hiddenContainers[j].classList.add('scroll-reset-container');
+              }
+              // 排掉本次隐藏/恢复以及回调自身 DOM 写入产生的 class 变动回声,
+              // 避免下一帧对已处理元素再跑一轮空扫。同步 JS 期间不会有其它来源
+              // 的 mutation 混入,丢弃是安全的。
+              observer.takeRecords();
+            }
           }
         }
 
