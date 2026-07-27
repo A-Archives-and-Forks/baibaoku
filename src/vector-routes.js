@@ -13,6 +13,13 @@ export function registerVectorRoutes(router, store) {
         sendOk(res, await store.upsert(req, database, scope, items));
     }));
 
+    router.post('/v1/vec/update-payload', route(async (req, res) => {
+        const database = normalizeDatabaseName(req.body?.database);
+        const scope = normalizeScope(req.body?.scope);
+        const items = normalizePayloadItems(req.body?.items);
+        sendOk(res, await store.updatePayload(req, database, scope, items));
+    }));
+
     router.post('/v1/vec/search', route(async (req, res) => {
         const database = normalizeDatabaseName(req.body?.database);
         const scopes = normalizeScopes(req.body?.scopes);
@@ -115,6 +122,24 @@ function normalizeUpsertItems(value) {
     });
 }
 
+function normalizePayloadItems(value) {
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ITEMS) {
+        throw new BaiBaoKuError('INVALID_ITEMS', `items must be a non-empty array up to ${MAX_ITEMS}.`, 400);
+    }
+    return value.map((it, index) => {
+        if (!it || typeof it !== 'object' || Array.isArray(it)) {
+            throw new BaiBaoKuError('INVALID_ITEM', 'Each item must be an object.', 400, { index });
+        }
+        if (typeof it.leafId !== 'string' || !it.leafId) {
+            throw new BaiBaoKuError('INVALID_ITEM', 'item.leafId must be a non-empty string.', 400, { index });
+        }
+        if (typeof it.payloadHash !== 'string' || !it.payloadHash) {
+            throw new BaiBaoKuError('INVALID_ITEM', 'item.payloadHash must be a non-empty string.', 400, { index });
+        }
+        return it;
+    });
+}
+
 function normalizeQueryVectors(value) {
     if (!Array.isArray(value) || value.length === 0 || value.length > MAX_QUERIES) {
         throw new BaiBaoKuError('INVALID_QUERIES', `queryVectors must be a non-empty array up to ${MAX_QUERIES}.`, 400);
@@ -136,7 +161,11 @@ function normalizePresent(value) {
         if (!p || typeof p !== 'object' || typeof p.leafId !== 'string' || !p.leafId) {
             throw new BaiBaoKuError('INVALID_PRESENT_ITEM', 'Each present item needs a leafId.', 400, { index });
         }
-        return { leafId: p.leafId, docHash: typeof p.docHash === 'string' ? p.docHash : '' };
+        return {
+            leafId: p.leafId,
+            docHash: typeof p.docHash === 'string' ? p.docHash : '',
+            payloadHash: typeof p.payloadHash === 'string' ? p.payloadHash : '',
+        };
     });
 }
 

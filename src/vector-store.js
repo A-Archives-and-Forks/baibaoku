@@ -37,6 +37,7 @@ export class VectorStore {
                 scope TEXT NOT NULL,
                 leaf_id TEXT NOT NULL,
                 doc_hash TEXT NOT NULL,
+                payload_hash TEXT NOT NULL DEFAULT '',
                 vector BLOB NOT NULL,
                 dim INTEGER NOT NULL,
                 document TEXT NOT NULL,
@@ -49,6 +50,10 @@ export class VectorStore {
 
             CREATE INDEX IF NOT EXISTS idx_vec_scope ON vec_items(scope);
         `);
+        const columns = new Set(db.prepare('PRAGMA table_info(vec_items)').all().map(column => column.name));
+        if (!columns.has('payload_hash')) {
+            db.exec("ALTER TABLE vec_items ADD COLUMN payload_hash TEXT NOT NULL DEFAULT ''");
+        }
     }
 
     /**
@@ -61,11 +66,12 @@ export class VectorStore {
         const now = Date.now();
         const stmt = db.prepare(`
             INSERT INTO vec_items
-                (scope, leaf_id, doc_hash, vector, dim, document, mes_full, story_time, msg_index, created_at)
+                (scope, leaf_id, doc_hash, payload_hash, vector, dim, document, mes_full, story_time, msg_index, created_at)
             VALUES
-                (@scope, @leafId, @docHash, @vector, @dim, @document, @mesFull, @storyTime, @msgIndex, @createdAt)
+                (@scope, @leafId, @docHash, @payloadHash, @vector, @dim, @document, @mesFull, @storyTime, @msgIndex, @createdAt)
             ON CONFLICT(scope, leaf_id) DO UPDATE SET
                 doc_hash = excluded.doc_hash,
+                payload_hash = excluded.payload_hash,
                 vector = excluded.vector,
                 dim = excluded.dim,
                 document = excluded.document,
@@ -87,6 +93,7 @@ export class VectorStore {
                     scope,
                     leafId: String(it.leafId),
                     docHash: String(it.docHash ?? ''),
+                    payloadHash: String(it.payloadHash ?? ''),
                     vector: buf,
                     dim,
                     document: String(it.document ?? ''),
@@ -101,6 +108,35 @@ export class VectorStore {
 
         const count = tx(items);
         return { database, scope, upserted: count };
+    }
+
+    /**
+     * 摘要未变时只刷新召回附属数据，不改 document/vector。
+     * 不存在的 leafId 不在这里补建，由 reconcile 的 missing 分支交给完整 upsert。
+     */
+    async updatePayload(req, database, scope, items) {
+        const db = await this.#db(req, database);
+        const stmt = db.prepare(`
+            UPDATE vec_items
+            SET payload_hash = @payloadHash,
+                mes_full = @mesFull,
+                story_time = @storyTime
+            WHERE scope = @scope AND leaf_id = @leafId
+        `);
+        const tx = db.transaction((rows) => {
+            let n = 0;
+            for (const it of rows) {
+                n += stmt.run({
+                    scope,
+                    leafId: String(it.leafId),
+                    payloadHash: String(it.payloadHash ?? ''),
+                    mesFull: it.mesFull == null ? null : String(it.mesFull),
+                    storyTime: it.storyTime == null ? null : String(it.storyTime),
+                }).changes;
+            }
+            return n;
+        });
+        return { database, scope, updated: tx(items) };
     }
 
     /**
@@ -149,7 +185,8 @@ export class VectorStore {
             }
             const key = String(r.leaf_id);
             const prev = fused.get(key);
-            if (!prev || best > prev.bestSim) {
+            // 跨 scope 同叶子同分时，scopes[0]（前端约定为当前聊天）优先于冻结 bundle。
+            if (!prev || best > prev.bestSim || (best === prev.bestSim && r.scope === scopes[0] && prev.row.scope !== scopes[0])) {
                 fused.set(key, { row: r, bestSim: best, bestQuery: bestQ });
             }
         }
@@ -189,23 +226,35 @@ export class VectorStore {
     /**
      * 对账某 scope 的索引与「前端当前应有的叶子集合」:
      *  - 删掉 scope 下不在 present 里的叶子(重摘换 id / 删楼 / 编辑失效留下的陈旧向量);
-     *  - 返回 present 里「后端没有、或 doc_hash 变了」的 leafId(需前端 embed 后 upsert)。
-     * present: [{ leafId, docHash }]。这是增量索引的核心:同文本(同 hash)不重复 embed。
+     *  - 返回 present 里「后端没有、或 doc_hash 变了」的 leafId(需前端 embed 后 upsert)；
+     *  - 摘要未变但 payload_hash 变了的 leafId 单独返回，只更新全文/时间，不重新 embed。
+     * present: [{ leafId, docHash, payloadHash }]。
      */
     async reconcile(req, database, scope, present) {
         const db = await this.#db(req, database);
-        const presentMap = new Map(present.map(p => [String(p.leafId), String(p.docHash ?? '')]));
+        const presentMap = new Map(present.map(p => [String(p.leafId), {
+            docHash: String(p.docHash ?? ''),
+            payloadHash: String(p.payloadHash ?? ''),
+        }]));
 
-        const rows = db.prepare('SELECT leaf_id, doc_hash FROM vec_items WHERE scope = ?').all(scope);
-        const existing = new Map(rows.map(r => [String(r.leaf_id), String(r.doc_hash)]));
+        const rows = db.prepare('SELECT leaf_id, doc_hash, payload_hash FROM vec_items WHERE scope = ?').all(scope);
+        const existing = new Map(rows.map(r => [String(r.leaf_id), {
+            docHash: String(r.doc_hash),
+            payloadHash: String(r.payload_hash ?? ''),
+        }]));
 
         const toDelete = [];
         for (const id of existing.keys()) if (!presentMap.has(id)) toDelete.push(id);
 
         const missing = [];
-        for (const [id, hash] of presentMap) {
+        const stalePayload = [];
+        for (const [id, hashes] of presentMap) {
             const cur = existing.get(id);
-            if (cur === undefined || cur !== hash) missing.push(id);
+            if (cur === undefined || cur.docHash !== hashes.docHash) {
+                missing.push(id);
+            } else if (cur.payloadHash !== hashes.payloadHash) {
+                stalePayload.push(id);
+            }
         }
 
         if (toDelete.length) {
@@ -216,7 +265,7 @@ export class VectorStore {
             tx();
         }
 
-        return { database, scope, deleted: toDelete.length, missing };
+        return { database, scope, deleted: toDelete.length, missing, stalePayload };
     }
 
     /** 清空某 scope(整聊天删除时用)。 */
@@ -245,14 +294,14 @@ export class VectorStore {
         const db = await this.#db(req, database);
         const sourceScope = `chat:${sourceChatId}`;
         const rows = db.prepare(`
-            SELECT leaf_id, doc_hash, vector, dim, document, mes_full, story_time, msg_index
+            SELECT leaf_id, doc_hash, payload_hash, vector, dim, document, mes_full, story_time, msg_index
             FROM vec_items WHERE scope = ?
             ORDER BY leaf_id
         `).all(sourceScope);
 
         // 内容寻址:对「叶子 id + 内容 hash」的有序集合算稳定 hash。空源也允许(得到固定空 hash)。
         const h = crypto.createHash('sha256');
-        for (const r of rows) h.update(`${r.leaf_id} ${r.doc_hash} `);
+        for (const r of rows) h.update(`${r.leaf_id} ${r.doc_hash} ${r.payload_hash} `);
         const hash = h.digest('hex').slice(0, 32);
         const bundleScope = `bundle:${hash}`;
 
@@ -264,14 +313,14 @@ export class VectorStore {
         const now = Date.now();
         const insert = db.prepare(`
             INSERT INTO vec_items
-                (scope, leaf_id, doc_hash, vector, dim, document, mes_full, story_time, msg_index, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (scope, leaf_id, doc_hash, payload_hash, vector, dim, document, mes_full, story_time, msg_index, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(scope, leaf_id) DO NOTHING
         `);
         const tx = db.transaction((src) => {
             for (const r of src) {
                 insert.run(
-                    bundleScope, r.leaf_id, r.doc_hash, r.vector, r.dim,
+                    bundleScope, r.leaf_id, r.doc_hash, r.payload_hash, r.vector, r.dim,
                     r.document, r.mes_full ?? null, r.story_time ?? null, r.msg_index ?? null, now,
                 );
             }
