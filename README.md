@@ -67,6 +67,16 @@ data/<user-handle>/baibaoku/databases/<database>.sqlite
 
 SQLite 使用 WAL 模式时会出现 `<database>.sqlite-wal` 和 `<database>.sqlite-shm`。柏宝库会在后端设置 WAL 保留上限，并在累计写入较多数据后自动执行 checkpoint/truncate；前端扩展不需要自己维护这些文件。
 
+## 后台生成的完整回复工具兼容
+
+`0.6.4` 起，save-generate 支持 OpenAI / Custom 来源中单个 `emit_complete_response` 或 `emit_complete_response_<字母数字后缀>` 工具，要求参数 schema 包含必填的字符串 `content`。原请求和工具定义保持不变；后端只把返回的完整正文工具解析为普通 assistant content，不执行任意工具。
+
+流式工具参数会在收齐并校验后输出正文；非流式也会统一浏览器响应和后台保存内容。多工具、错误函数名、截断或无效参数会报错，不会作为成功回复保存。普通文本回复（含代理错误正文）保持兼容。
+
+更新后需要重启 SillyTavern，并搭配支持该能力的前端扩展。`/v1/status` 返回 `data.capabilities.saveGenerateCompleteResponseTool: true`，供前端判断是否可接管这类请求。
+
+离线回归测试：`npm run test:save-generate`（不请求上游 API、不读写用户聊天）。黑名单检测和自动重新生成仍由前端负责，关闭页面后不会在服务端运行。
+
 ## 开发者文档
 
 - [API 文档](docs/api.md)

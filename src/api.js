@@ -209,6 +209,7 @@ async function getStatusPayload(req, manager) {
         id: PLUGIN_ID,
         name: PLUGIN_NAME,
         version: PLUGIN_VERSION,
+        capabilities: { saveGenerateCompleteResponseTool: true },
         apiVersion: API_VERSION,
         storage: 'per-user',
         user: req.user?.profile?.handle ?? null,

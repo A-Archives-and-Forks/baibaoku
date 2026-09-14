@@ -92,7 +92,10 @@ GET /api/plugins/baibaoku/v1/status
     "installed": true,
     "id": "baibaoku",
     "name": "柏宝库",
-    "version": "0.6.3",
+    "version": "0.6.4",
+    "capabilities": {
+      "saveGenerateCompleteResponseTool": true
+    },
     "apiVersion": "v1",
     "storage": "per-user",
     "user": "default-user",
@@ -103,6 +106,8 @@ GET /api/plugins/baibaoku/v1/status
   }
 }
 ```
+
+`capabilities` 声明当前版本支持的可选能力。`saveGenerateCompleteResponseTool` 为 `true` 时，save-generate 可以解包单个完整回复工具（见下文），前端据此决定是否接管这类请求。
 
 如果请求返回 404、403 或网络错误，调用方应该视为柏宝库不可用。柏宝库没安装时，它自己无法返回状态，所以“未安装”需要由调用方捕获请求失败来判断。
 
@@ -407,7 +412,7 @@ Supported in v1:
 - normal and regenerate assistant replies only
 - chat-completions only
 - no multi-swipe (`n > 1`)
-- no tool calls
+- at most one complete-response envelope tool (`emit_complete_response` or `emit_complete_response_<alphanumeric suffix>` with a required string `content` parameter); its arguments are unwrapped into a normal assistant reply, and all other tool calls are rejected
 
 Request:
 ```json
@@ -441,7 +446,10 @@ client and exposes the job id in `X-Baibaoku-Save-Generate-Job-Id`. If the
 stream already produced assistant text, later stream truncation or upstream
 errors are treated as a partial but valid generation and the collected text is
 saved. Explicit API errors with no assistant text are reported as generation
-failures.
+failures. When a complete-response envelope tool is used, its arguments are
+withheld from the client and not persisted until the call is fully received and
+validated; incomplete or invalid arguments fail the generation instead of being
+saved as a partial reply.
 
 Poll status:
 ```text

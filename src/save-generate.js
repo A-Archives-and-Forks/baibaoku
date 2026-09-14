@@ -11,6 +11,7 @@ import { tryParse } from '../../../src/util.js';
 import { loadSqliteDriver } from './database.js';
 import { setHeaderIfValid, setSafeHeader } from './header-utils.js';
 import { getStoragePaths } from './paths.js';
+import { getCompleteResponseToolName, createCompleteResponseStream, normalizeCompleteResponse } from './save-generate-tools.js';
 
 const SAVE_GENERATE_JOB_TTL_MS = 2 * 24 * 60 * 60 * 1000;
 const SAVE_GENERATE_MAX_JOBS = 10;
@@ -251,8 +252,8 @@ function validateSaveGenerateRequest(save, generate) {
         throwHttpError('Multi-swipe generation is not supported by save-generate v1', 400);
     }
 
-    if (Array.isArray(generate.tools) && generate.tools.length > 0) {
-        throwHttpError('Tool calls are not supported by save-generate v1', 400);
+    if (Array.isArray(generate.tools) && generate.tools.length > 0 && !getCompleteResponseToolName(generate)) {
+        throwHttpError('Only the complete-response envelope tool is supported by save-generate v1', 400);
     }
 }
 
@@ -312,7 +313,8 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
         generateStartedAt: Date.now(),
     });
 
-    const streamState = createStreamingState(job.generate.chat_completion_source);
+    const toolName = getCompleteResponseToolName(job.generate);
+    const streamState = createStreamingState(job.generate.chat_completion_source, toolName);
     let clientOpen = Boolean(streamResponse);
 
     if (streamResponse) {
@@ -372,7 +374,7 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
                 throw makeSaveGenerateCancelError();
             }
 
-            if (job.generate.stream === true && streamState.text) {
+            if (job.generate.stream === true && streamState.canSavePartial && streamState.text) {
                 await finishGeneratedResult(job, {
                     text: streamState.text,
                     reasoning: streamState.reasoning,
@@ -385,6 +387,18 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
 
             const detail = response.bodyText || response.statusMessage || 'Generation failed';
             throwHttpError(detail, response.statusCode || SAVE_GENERATE_DEFAULT_ERROR_STATUS);
+        }
+
+        if (job.generate.stream === true) {
+            writeStreamChunksToClient(streamResponse, clientOpen, streamState.finish());
+        } else if (toolName) {
+            // The browser and persisted job must receive the same unwrapped reply.
+            let parsed;
+            try { parsed = JSON.parse(response.bodyText); } catch { /* Preserve native non-JSON handling. */ }
+            if (parsed) {
+                response.bodyText = JSON.stringify(normalizeCompleteResponse(parsed, toolName));
+                response.body = Buffer.from(response.bodyText, 'utf8');
+            }
         }
 
         const result = job.generate.stream === true
@@ -417,7 +431,7 @@ async function runSaveGenerateJob(job, { streamResponse = null } = {}) {
             return { job, response };
         }
 
-        if (job.generate.stream === true && streamState.text) {
+        if (job.generate.stream === true && streamState.canSavePartial && streamState.text) {
             await finishGeneratedResult(job, {
                 text: streamState.text,
                 reasoning: streamState.reasoning,
@@ -752,11 +766,14 @@ class CaptureResponse extends Writable {
     }
 }
 
-function createStreamingState(chatCompletionSource) {
+function createStreamingState(chatCompletionSource, toolName = '') {
+    const toolStream = toolName ? createCompleteResponseStream(toolName) : null;
     const decoder = new StringDecoder('utf8');
     let buffer = '';
     const doneChunks = [];
     return {
+        // Never persist incomplete or invalid tool arguments as a partial reply.
+        get canSavePartial() { return !toolStream?.started; },
         text: '',
         reasoning: '',
         push(chunk) {
@@ -784,25 +801,40 @@ function createStreamingState(chatCompletionSource) {
 
                 const data = dataLines.join('\n');
                 if (data === '[DONE]') {
+                    clientChunks.push(...this.finishTool());
                     doneChunks.push(Buffer.from(`${eventText}${eventDelimiter}`, 'utf8'));
                     continue;
                 }
 
-                try {
-                    const parsed = JSON.parse(data);
-                    if (this.text && getGenerateErrorFromParsed(parsed)) {
-                        continue;
-                    }
-                    const extracted = extractStreamingResult(parsed, chatCompletionSource);
-                    this.text += extracted.text || '';
-                    this.reasoning += extracted.reasoning || '';
+                let parsed;
+                try { parsed = JSON.parse(data); } catch {
                     clientChunks.push(Buffer.from(`${eventText}${eventDelimiter}`, 'utf8'));
-                } catch {
-                    clientChunks.push(Buffer.from(`${eventText}${eventDelimiter}`, 'utf8'));
+                    continue;
                 }
+                if (this.text && getGenerateErrorFromParsed(parsed)) continue;
+                // Keep tool validation outside the JSON fallback: malformed calls must fail.
+                if (toolStream) parsed = toolStream.push(parsed);
+                const extracted = extractStreamingResult(parsed, chatCompletionSource);
+                this.text += extracted.text || '';
+                this.reasoning += extracted.reasoning || '';
+                clientChunks.push(Buffer.from(toolStream
+                    ? `data: ${JSON.stringify(parsed)}\n\n`
+                    : `${eventText}${eventDelimiter}`, 'utf8'));
             }
 
             return clientChunks;
+        },
+        finishTool() {
+            const final = toolStream?.finish();
+            if (!final) return [];
+            this.text += final.choices[0].delta.content;
+            return [Buffer.from(`data: ${JSON.stringify(final)}\n\n`, 'utf8')];
+        },
+        finish() {
+            buffer += decoder.end();
+            // Some proxies close at EOF without a final SSE delimiter or [DONE].
+            const chunks = buffer.trim() ? this.push(Buffer.from('\n\n')) : [];
+            return [...chunks, ...this.finishTool()];
         },
         takeDoneChunks() {
             return doneChunks.splice(0, doneChunks.length);
